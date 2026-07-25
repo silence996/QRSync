@@ -29,14 +29,33 @@ let zxingUseHardMode = false;
 let imageQueue = [];
 let currentImageIndex = -1;
 
-/** 高帧采样 + 多 Worker，尽量在短展示窗内完成多次尝试 */
+/** 相机扫码可调参数（也可运行时改 window.QRSyncScanTuning） */
+const SCAN_TUNING = {
+    /** 同时解码的 Worker 数（并行消费队列） */
+    workerInflight: 2,
+    /** 帧队列最大长度；满则背压丢弃新帧 */
+    queueMax: 6,
+    /** 入队采样间隔 ms；目标 100ms 播放时建议 ≤50 */
+    sampleIntervalMs: 50,
+    /** 与上一入队帧指纹相同则跳过 */
+    frameDedupe: true,
+    /** 解码边长上限 */
+    decodeMaxEdge: 560,
+    /** 目标播放间隔（仅用于日志对照） */
+    targetIntervalMs: 100
+};
+window.QRSyncScanTuning = SCAN_TUNING;
+
+/** rAF 采帧上限；真正入队由 sampleIntervalMs 控制 */
 const SCAN_FPS = 60;
-const DECODE_MAX_EDGE = 560;
+/** Worker 池大小（需 ≤ index.html 里 wasm 副本数） */
 const DECODE_WORKER_COUNT = 3;
 /** 相同内容去抖；连播时不同分片不受影响 */
 const SAME_TEXT_DEBOUNCE_MS = 80;
-/** 命中后短暂停投帧，避免 3 个 Worker 重复解同一张 QR */
-const POST_HIT_COOLDOWN_MS = 70;
+
+function getDecodeMaxEdge() {
+    return SCAN_TUNING.decodeMaxEdge || 560;
+}
 
 const DB = localforage.createInstance({ name: 'qrcode-receiver-v2' });
 
@@ -196,12 +215,13 @@ function resizeCanvas(canvas, width, height) {
     }
 }
 
-/** 将 ImageData 最长边限制在 DECODE_MAX_EDGE 以内 */
+/** 将 ImageData 最长边限制在 decodeMaxEdge 以内 */
 function prepareImageDataForDecode(imgData) {
+    const maxEdge = getDecodeMaxEdge();
     const maxDim = Math.max(imgData.width, imgData.height);
-    if (maxDim <= DECODE_MAX_EDGE) return imgData;
+    if (maxDim <= maxEdge) return imgData;
 
-    const scale = DECODE_MAX_EDGE / maxDim;
+    const scale = maxEdge / maxDim;
     const w = Math.max(1, Math.round(imgData.width * scale));
     const h = Math.max(1, Math.round(imgData.height * scale));
 
@@ -249,13 +269,80 @@ function noteDecodeResult(ok) {
 
 // ===== 统一解码函数 =====
 // 优先走 Worker（不阻塞 UI）；Worker 不可用时再主线程 ZXing / jsQR
-async function decodeImageData(imgData, { forceHard = false } = {}) {
+
+const DECODE_TIMING = {
+    n: 0,
+    sum: 0,
+    max: 0,
+    hit: 0,
+    miss: 0
+};
+
+function resetDecodeTiming() {
+    DECODE_TIMING.n = 0;
+    DECODE_TIMING.sum = 0;
+    DECODE_TIMING.max = 0;
+    DECODE_TIMING.hit = 0;
+    DECODE_TIMING.miss = 0;
+}
+
+function logDecodeTiming(ms, ok, meta) {
+    DECODE_TIMING.n++;
+    DECODE_TIMING.sum += ms;
+    if (ms > DECODE_TIMING.max) DECODE_TIMING.max = ms;
+    if (ok) DECODE_TIMING.hit++;
+    else DECODE_TIMING.miss++;
+
+    const avg = DECODE_TIMING.sum / DECODE_TIMING.n;
+    const workers = Math.max(1, SCAN_TUNING.workerInflight || 1);
+    const suggest = Math.ceil(avg / workers);
+
+    console.log(
+        `[decode] ${ms.toFixed(1)}ms ${ok ? 'HIT' : 'MISS'}` +
+        ` ${meta.w}x${meta.h}` +
+        (meta.forceHard ? ' hard' : '') +
+        (meta.path ? ` via=${meta.path}` : '') +
+        (meta.frameId != null ? ` frame=#${meta.frameId}` : '') +
+        (meta.queue != null ? ` q=${meta.queue}` : '') +
+        (meta.inflight != null ? ` inflight=${meta.inflight}` : '')
+    );
+
+    if (DECODE_TIMING.n % 20 === 0) {
+        console.log(
+            `[decode] stats n=${DECODE_TIMING.n}` +
+            ` avg=${avg.toFixed(1)}ms` +
+            ` max=${DECODE_TIMING.max.toFixed(1)}ms` +
+            ` hit=${DECODE_TIMING.hit}` +
+            ` miss=${DECODE_TIMING.miss}` +
+            ` | 流水线建议间隔 ≥ ${suggest}ms（avg/${workers}）` +
+            ` 目标=${SCAN_TUNING.targetIntervalMs}ms`
+        );
+    }
+}
+
+async function decodeImageData(imgData, { forceHard = false, logMeta = null } = {}) {
+    const t0 = performance.now();
     imgData = prepareImageDataForDecode(imgData);
     const options = getZXingOptions(forceHard);
+    let text = null;
+    let path = 'none';
+
+    const emitLog = () => {
+        logDecodeTiming(performance.now() - t0, !!text, {
+            w: imgData.width,
+            h: imgData.height,
+            forceHard,
+            path,
+            ...(logMeta || {})
+        });
+    };
 
     if (decodeWorkerReady) {
         try {
-            return await decodeOnWorker(imgData, options);
+            text = await decodeOnWorker(imgData, options);
+            path = 'worker';
+            emitLog();
+            return text;
         } catch (_) {
             // Worker 异常时回退主线程
         }
@@ -264,11 +351,18 @@ async function decodeImageData(imgData, { forceHard = false } = {}) {
     if (typeof ZXingWASM !== 'undefined' && ZXingWASM._wasmReady) {
         try {
             const results = await ZXingWASM.readBarcodesFromImageData(imgData, options);
-            if (results.length > 0) return results[0].text;
+            if (results.length > 0) text = results[0].text;
+            path = 'main-zxing';
         } catch (_) {}
     }
-    const r = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: 'dontInvert' });
-    return r ? r.data : null;
+    if (!text) {
+        const r = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: 'dontInvert' });
+        text = r ? r.data : null;
+        path = text ? 'jsQR' : (path === 'none' ? 'jsQR' : path);
+    }
+
+    emitLog();
+    return text;
 }
 
 // ===== 相机模式 =====
@@ -310,7 +404,7 @@ function captureFrame(video) {
     const srcSize = Math.min(vw, vh);
     const sx = Math.round((vw - srcSize) / 2);
     const sy = Math.round((vh - srcSize) / 2);
-    const dstSize = Math.min(srcSize, DECODE_MAX_EDGE);
+    const dstSize = Math.min(srcSize, getDecodeMaxEdge());
 
     ensureCropCanvas();
     resizeCanvas(cropCanvas, dstSize, dstSize);
@@ -320,55 +414,149 @@ function captureFrame(video) {
     return cropCtx.getImageData(0, 0, dstSize, dstSize);
 }
 
+/** 廉价帧指纹，用于入队去重 */
+function frameFingerprint(imgData) {
+    const d = imgData.data;
+    const len = d.length;
+    const step = Math.max(64, ((len / 128) | 0) & ~3);
+    let h = (imgData.width * 73856093) ^ (imgData.height * 19349663);
+    for (let i = 0; i < len; i += step) {
+        h = (Math.imul(h, 31) + d[i]) | 0;
+    }
+    return h;
+}
+
 function startScanLoop(video) {
     /**
-     * 忙时只保留最新帧；命中后 cooldown + 单路解码，把并行留给换片/未命中。
-     * 成功结果一律接受（乱序分片仍有价值）；过期未命中结果忽略，避免拖慢策略。
+     * 帧队列 + N Worker 并行消费不同历史帧。
+     * 参数见 SCAN_TUNING / window.QRSyncScanTuning（运行时可改，无需重载，除 worker 池大小）。
      */
-    const poolSize = Math.max(1, decodeWorkers.length || 1);
+    resetDecodeTiming();
+
+    const frameQueue = [];
     let inflight = 0;
-    let queuedFrame = null;
-    let decodeSeq = 0;
-    let cooldownUntil = 0;
-    /** 连播默认单路；连续未命中再放开并行 */
-    let preferSingle = true;
+    let frameIdSeq = 0;
+    let lastSampleAt = 0;
+    let lastEnqueuedFp = null;
+    const qStats = {
+        enqueued: 0,
+        dequeued: 0,
+        dropFull: 0,
+        dropDedupe: 0
+    };
+    let lastStatsLogAt = 0;
 
-    function currentMaxInflight() {
-        return preferSingle ? 1 : poolSize;
+    function currentInflightLimit() {
+        const want = Math.max(1, SCAN_TUNING.workerInflight | 0);
+        const pool = Math.max(1, decodeWorkers.length || 1);
+        return Math.min(want, pool);
     }
 
-    function runDecode(imgData) {
-        const seq = ++decodeSeq;
-        inflight++;
-        decodeImageData(imgData)
-            .then((text) => {
-                if (text) {
-                    noteDecodeResult(true);
-                    handleScanResult(text);
-                    cooldownUntil = performance.now() + POST_HIT_COOLDOWN_MS;
-                    preferSingle = true;
-                    queuedFrame = null;
-                    return;
-                }
-                // 过期未命中：已有更新请求或待解最新帧时忽略
-                if (seq < decodeSeq || queuedFrame) return;
-                noteDecodeResult(false);
-                preferSingle = false;
-            })
-            .catch(() => {
-                if (seq < decodeSeq || queuedFrame) return;
-                noteDecodeResult(false);
-                preferSingle = false;
-            })
-            .finally(() => {
-                inflight--;
-                if (queuedFrame && inflight < currentMaxInflight()) {
-                    const next = queuedFrame;
-                    queuedFrame = null;
-                    runDecode(next);
-                }
-            });
+    function logScanStats(force) {
+        const now = performance.now();
+        if (!force && now - lastStatsLogAt < 1000) return;
+        lastStatsLogAt = now;
+        const avg = DECODE_TIMING.n ? DECODE_TIMING.sum / DECODE_TIMING.n : 0;
+        const workers = currentInflightLimit();
+        console.log(
+            `[scan] q=${frameQueue.length}/${SCAN_TUNING.queueMax}` +
+            ` inflight=${inflight}/${workers}` +
+            ` enq=${qStats.enqueued} deq=${qStats.dequeued}` +
+            ` dropFull=${qStats.dropFull} dropDedupe=${qStats.dropDedupe}` +
+            ` decodeAvg=${avg.toFixed(1)}ms` +
+            ` suggest≥${avg ? Math.ceil(avg / workers) : '?'}ms` +
+            ` target=${SCAN_TUNING.targetIntervalMs}ms` +
+            ` sample=${SCAN_TUNING.sampleIntervalMs}ms`
+        );
     }
+
+    function pumpDecode() {
+        const limit = currentInflightLimit();
+        while (inflight < limit && frameQueue.length > 0) {
+            const item = frameQueue.shift();
+            qStats.dequeued++;
+            inflight++;
+            console.log(
+                `[scan] dequeue #${item.id} → decode` +
+                ` q=${frameQueue.length} inflight=${inflight}/${limit}`
+            );
+            decodeImageData(item.imgData, {
+                logMeta: {
+                    frameId: item.id,
+                    queue: frameQueue.length,
+                    inflight
+                }
+            })
+                .then((text) => {
+                    if (text) {
+                        noteDecodeResult(true);
+                        handleScanResult(text);
+                    } else {
+                        noteDecodeResult(false);
+                    }
+                })
+                .catch(() => noteDecodeResult(false))
+                .finally(() => {
+                    inflight--;
+                    pumpDecode();
+                    logScanStats(false);
+                });
+        }
+    }
+
+    function tryEnqueue(imgData, now) {
+        const sampleMs = Math.max(16, SCAN_TUNING.sampleIntervalMs | 0);
+        if (now - lastSampleAt < sampleMs) {
+            return;
+        }
+        lastSampleAt = now;
+
+        const queueMax = Math.max(1, SCAN_TUNING.queueMax | 0);
+        if (frameQueue.length >= queueMax) {
+            qStats.dropFull++;
+            console.log(
+                `[scan] drop FULL q=${frameQueue.length}/${queueMax}` +
+                ` inflight=${inflight} (背压，保留队列内历史帧)`
+            );
+            logScanStats(false);
+            return;
+        }
+
+        if (SCAN_TUNING.frameDedupe) {
+            const fp = frameFingerprint(imgData);
+            if (lastEnqueuedFp !== null && fp === lastEnqueuedFp) {
+                qStats.dropDedupe++;
+                return;
+            }
+            lastEnqueuedFp = fp;
+        }
+
+        const id = ++frameIdSeq;
+        frameQueue.push({ id, imgData, at: now });
+        qStats.enqueued++;
+        console.log(
+            `[scan] enqueue #${id} q=${frameQueue.length}/${queueMax}` +
+            ` inflight=${inflight}/${currentInflightLimit()}`
+        );
+        pumpDecode();
+    }
+
+    console.log(
+        '[scan] queue pipeline started',
+        {
+            workerInflight: SCAN_TUNING.workerInflight,
+            queueMax: SCAN_TUNING.queueMax,
+            sampleIntervalMs: SCAN_TUNING.sampleIntervalMs,
+            frameDedupe: SCAN_TUNING.frameDedupe,
+            decodeMaxEdge: SCAN_TUNING.decodeMaxEdge,
+            targetIntervalMs: SCAN_TUNING.targetIntervalMs,
+            poolSize: decodeWorkers.length
+        }
+    );
+    console.log(
+        '[scan] 运行时可调: window.QRSyncScanTuning.' +
+        '{workerInflight,queueMax,sampleIntervalMs,frameDedupe,decodeMaxEdge,targetIntervalMs}'
+    );
 
     function tick(now) {
         if (!isScanning) return;
@@ -379,9 +567,6 @@ function startScanLoop(video) {
         if (video.readyState < 2) return;
         if (!video.videoWidth || !video.videoHeight) return;
 
-        // 命中后短暂停投，避免同一张 QR 打满 Worker
-        if (now < cooldownUntil) return;
-
         let imgData;
         try {
             imgData = captureFrame(video);
@@ -389,11 +574,8 @@ function startScanLoop(video) {
             return;
         }
 
-        if (inflight >= currentMaxInflight()) {
-            queuedFrame = imgData;
-            return;
-        }
-        runDecode(imgData);
+        tryEnqueue(imgData, now);
+        logScanStats(false);
     }
 
     scanRafId = requestAnimationFrame(tick);
@@ -403,6 +585,20 @@ function stopScanLoop() {
     if (scanRafId !== null) {
         cancelAnimationFrame(scanRafId);
         scanRafId = null;
+    }
+    if (DECODE_TIMING.n > 0) {
+        const avg = DECODE_TIMING.sum / DECODE_TIMING.n;
+        const workers = Math.max(1, SCAN_TUNING.workerInflight || 1);
+        console.log(
+            `[scan] pipeline stopped` +
+            ` decode n=${DECODE_TIMING.n}` +
+            ` avg=${avg.toFixed(1)}ms` +
+            ` max=${DECODE_TIMING.max.toFixed(1)}ms` +
+            ` hit=${DECODE_TIMING.hit}` +
+            ` miss=${DECODE_TIMING.miss}` +
+            ` suggest≥${Math.ceil(avg / workers)}ms` +
+            ` target=${SCAN_TUNING.targetIntervalMs}ms`
+        );
     }
     cropCanvas = null;
     cropCtx = null;
@@ -507,18 +703,49 @@ async function stopCamera() {
 
 // ===== 扫描结果处理 =====
 
+let _uiRafPending = false;
+function scheduleUpdateUI() {
+    if (_uiRafPending) return;
+    _uiRafPending = true;
+    requestAnimationFrame(() => {
+        _uiRafPending = false;
+        updateUI();
+    });
+}
+
+let _feedbackRafPending = false;
+let _pendingFeedback = null;
+/** 成功反馈合并到下一帧，避免连扫时 DOM 更新堵住采帧 */
+function scheduleSuccessFeedback(floatingMsg, statusMsg, statusType = 'success') {
+    _pendingFeedback = { floatingMsg, statusMsg, statusType };
+    if (_feedbackRafPending) return;
+    _feedbackRafPending = true;
+    requestAnimationFrame(() => {
+        _feedbackRafPending = false;
+        const f = _pendingFeedback;
+        _pendingFeedback = null;
+        if (!f) return;
+        if (f.floatingMsg) showFloatingMessage(f.floatingMsg);
+        if (f.statusMsg) showCameraStatus(f.statusMsg, f.statusType);
+    });
+}
+
+let _scanFlashTimer = null;
+function flashScanSuccess() {
+    const scanWindow = document.getElementById('scan-window');
+    if (!scanWindow) return;
+    scanWindow.classList.add('scan-success');
+    clearTimeout(_scanFlashTimer);
+    _scanFlashTimer = setTimeout(() => scanWindow.classList.remove('scan-success'), 200);
+}
+
 function handleScanResult(decodedText) {
     const now = Date.now();
     if (now - lastScanTime < SAME_TEXT_DEBOUNCE_MS && decodedText === lastDecodedText) return;
     lastScanTime = now;
     lastDecodedText = decodedText;
 
-    const scanWindow = document.getElementById('scan-window');
-    if (scanWindow) {
-        scanWindow.classList.add('scan-success');
-        setTimeout(() => scanWindow.classList.remove('scan-success'), 300);
-    }
-
+    requestAnimationFrame(flashScanSuccess);
     processChunkData(decodedText);
 }
 
@@ -546,9 +773,8 @@ async function processChunkData(data) {
                 receivedFileName = fileInfo.filename;
                 showFingerprintDisplay(currentFileFingerprint);
                 persistMeta();
-                updateUI();
-                showFloatingMessage('📄 文件名接收成功');
-                showCameraStatus(`✅ 文件: ${receivedFileName}`, 'success');
+                scheduleUpdateUI();
+                scheduleSuccessFeedback('📄 文件名接收成功', `✅ 文件: ${receivedFileName}`);
             } else {
                 if (!currentFileFingerprint) {
                     currentFileFingerprint = packet.f;
@@ -558,7 +784,7 @@ async function processChunkData(data) {
                     return;
                 }
                 if (receivedChunks.has(packet.i)) {
-                    showFloatingMessage(`⚠️ 分片 ${packet.i + 1}/${packet.t} 已接收过`);
+                    // 已接收：静默跳过，避免连扫时频繁刷 UI
                     return;
                 }
                 if (!fileInfo) {
@@ -573,11 +799,10 @@ async function processChunkData(data) {
                 const b64 = uint8ArrayToBase64(packet.payload);
                 receivedChunks.set(packet.i, b64);
                 persistChunk(packet.i, b64);
-                updateUI();
-                showFloatingMessage(`✅ 分片 ${packet.i + 1}/${packet.t}`);
-                showCameraStatus(
-                    `✅ 成功接收数据分片 ${packet.i + 1}/${fileInfo.totalChunks}`,
-                    'success'
+                scheduleUpdateUI();
+                scheduleSuccessFeedback(
+                    `✅ 分片 ${packet.i + 1}/${packet.t}`,
+                    `✅ 成功接收数据分片 ${packet.i + 1}/${fileInfo.totalChunks}`
                 );
             }
 
@@ -585,7 +810,7 @@ async function processChunkData(data) {
                 receivedChunks.size >= fileInfo.totalChunks &&
                 fileInfo.filename !== '未知文件') {
                 document.getElementById('btn-reassemble').disabled = false;
-                showFloatingMessage('🎉 接收完成！');
+                scheduleSuccessFeedback('🎉 接收完成！', '🎉 接收完成！');
                 setTimeout(() => stopCamera(), 500);
             }
             return;
@@ -629,9 +854,8 @@ async function processChunkData(data) {
 
             showFingerprintDisplay(currentFileFingerprint);
             persistMeta();
-            updateUI();
-            showFloatingMessage('📄 文件名接收成功');
-            showCameraStatus(`✅ 文件: ${receivedFileName}`, 'success');
+            scheduleUpdateUI();
+            scheduleSuccessFeedback('📄 文件名接收成功', `✅ 文件: ${receivedFileName}`);
         } else {
             // 数据分片
             if (typeof chunk.i !== 'number' || !chunk.t || !chunk.d || !chunk.f || !chunk.h)
@@ -651,7 +875,6 @@ async function processChunkData(data) {
             }
 
             if (receivedChunks.has(chunk.i)) {
-                showFloatingMessage(`⚠️ 分片 ${chunk.i+1}/${chunk.t} 已接收过`);
                 return;
             }
 
@@ -660,9 +883,11 @@ async function processChunkData(data) {
             receivedChunks.set(chunk.i, chunk.d);
             // 异步落盘，不阻塞扫码主路径
             persistChunk(chunk.i, chunk.d);
-            updateUI();
-            showFloatingMessage(`✅ 分片 ${chunk.i+1}/${chunk.t}`);
-            showCameraStatus(`✅ 成功接收数据分片 ${chunk.i+1}/${fileInfo.totalChunks}`, 'success');
+            scheduleUpdateUI();
+            scheduleSuccessFeedback(
+                `✅ 分片 ${chunk.i+1}/${chunk.t}`,
+                `✅ 成功接收数据分片 ${chunk.i+1}/${fileInfo.totalChunks}`
+            );
         }
 
         // 检查是否完整
@@ -670,7 +895,7 @@ async function processChunkData(data) {
             receivedChunks.size >= fileInfo.totalChunks &&
             fileInfo.filename !== '未知文件') {
             document.getElementById('btn-reassemble').disabled = false;
-            showFloatingMessage('🎉 接收完成！');
+            scheduleSuccessFeedback('🎉 接收完成！', '🎉 接收完成！');
             setTimeout(() => stopCamera(), 500);
         }
     } catch (err) {
