@@ -29,16 +29,16 @@ let zxingUseHardMode = false;
 let imageQueue = [];
 let currentImageIndex = -1;
 
-/** 相机扫码可调参数（也可运行时改 window.QRSyncScanTuning） */
+/** 相机扫码可调参数（与发送端播放间隔解耦；也可运行时改 window.QRSyncScanTuning） */
 const SCAN_TUNING = {
     /**
-     * 同时解码路数。单张解码≈20–30ms 时，1 路即可跟上 100ms 播放；
+     * 同时解码路数。单张解码≈20–30ms 时 1 路通常足够；
      * 2 路容易在 HIT 后仍有 in-flight DUP。难扫可改为 2。
      */
     workerInflight: 1,
     /** 帧队列最大长度；满则背压丢弃新帧 */
     queueMax: 6,
-    /** 入队采样间隔 ms；100ms 播放建议 20–25 */
+    /** 入队采样间隔 ms（仅控制采帧密度，不跟随发送间隔） */
     sampleIntervalMs: 25,
     /**
      * 指纹去重：
@@ -46,20 +46,8 @@ const SCAN_TUNING = {
      * false = 完全不去重
      */
     frameDedupe: true,
-    /**
-     * NEW HIT 后静默 ms（仅设一次；sameText DUP 不续期，避免滚雪球错过换码）。
-     * 建议约为 targetInterval 的 40%～50%。
-     */
-    quietAfterHitMs: 100,
-    /**
-     * 某文本首次 NEW HIT 后的同码锁定 ms：期间一律不入队（sameText 不延长）。
-     * 用于挡住指纹抖动导致的同码 DUP，约为 targetInterval 的 80%。
-     */
-    sameTextHoldMs: 200,
     /** 解码边长上限 */
-    decodeMaxEdge: 560,
-    /** 目标播放间隔（与发送端默认一致，仅用于日志对照） */
-    targetIntervalMs: 250
+    decodeMaxEdge: 560
 };
 window.QRSyncScanTuning = SCAN_TUNING;
 
@@ -115,7 +103,7 @@ async function ensureDecodeWorkerScriptUrl() {
         console.log('[decode-worker] file:// 模式：加载 decode-worker-source.js → Blob Worker');
         const t0 = performance.now();
         if (!window.__QRSyncDecodeWorkerSource) {
-            await loadScriptOnce('decode-worker-source.js?v=20260726-interval250');
+            await loadScriptOnce('decode-worker-source.js?v=20260726-decouple1');
         }
         const source = window.__QRSyncDecodeWorkerSource;
         if (!source || typeof source !== 'string') {
@@ -422,8 +410,7 @@ function logDecodeTiming(ms, ok, meta) {
             ` max=${DECODE_TIMING.max.toFixed(1)}ms` +
             ` hit=${DECODE_TIMING.hit}` +
             ` miss=${DECODE_TIMING.miss}` +
-            ` | 流水线建议间隔 ≥ ${suggest}ms（avg/${workers}）` +
-            ` 目标=${SCAN_TUNING.targetIntervalMs}ms`
+            ` | 流水线建议间隔 ≥ ${suggest}ms（avg/${workers}）`
         );
     }
 }
@@ -614,9 +601,6 @@ function startScanLoop(video) {
     let lastHitFp = null;
     let lastHitText = null;
     let lastEnqueuedFp = null;
-    let quietUntil = 0;
-    /** 某文本首次 NEW 后的绝对锁定截止（sameText 不延长） */
-    let sameTextHoldUntil = 0;
     let missStreak = 0;
     let hitStreak = 0;
     /** 本轮扫描解码到的分片（含重复 HIT） */
@@ -688,7 +672,6 @@ function startScanLoop(video) {
             ` missStreak=${missStreak}` +
             ` decodeAvg=${avg.toFixed(1)}ms` +
             ` suggest≥${avg ? Math.ceil(avg / workers) : '?'}ms` +
-            ` target=${SCAN_TUNING.targetIntervalMs}ms` +
             ` sample=${SCAN_TUNING.sampleIntervalMs}ms`
         );
         if (receivedChunks.size !== lastRecvCount || force) {
@@ -729,10 +712,9 @@ function startScanLoop(video) {
                         return;
                     }
 
-                    const quietMs = Math.max(0, SCAN_TUNING.quietAfterHitMs | 0);
                     const isDupText = !!lastHitText && text === lastHitText;
 
-                    // sameText / in-flight DUP：不续期 quiet/hold（续期会滚雪球错过换码）
+                    // sameText：内容驱动抑制，不依赖发送间隔
                     if (isDupText) {
                         lastHitFp = item.fp;
                         if (frameQueue.length) {
@@ -746,7 +728,7 @@ function startScanLoop(video) {
                         if (qStats.dupChunk <= 3 || qStats.dupChunk % 10 === 0) {
                             console.log(
                                 `[scan] HIT DUP sameText frame=#${item.id}` +
-                                ` ${ms.toFixed(1)}ms (no hold extend)` +
+                                ` ${ms.toFixed(1)}ms` +
                                 ` recv=${receivedChunks.size}` +
                                 (totalHint ? `/${totalHint}` : '')
                             );
@@ -754,11 +736,7 @@ function startScanLoop(video) {
                         return;
                     }
 
-                    // 新内容：清空队列 + 短静默 + 同码时间窗锁定
-                    const holdMs = Math.max(0, SCAN_TUNING.sameTextHoldMs | 0);
-                    const nowHit = performance.now();
-                    quietUntil = nowHit + quietMs;
-                    sameTextHoldUntil = nowHit + holdMs;
+                    // 新内容：清队列，把算力留给后续帧（无时间窗静默）
                     if (frameQueue.length) {
                         qStats.dropQuiet += frameQueue.length;
                         frameQueue.length = 0;
@@ -786,14 +764,13 @@ function startScanLoop(video) {
                             ` frame=#${item.id}` +
                             ` ${ms.toFixed(1)}ms` +
                             ` ${isNew ? 'NEW' : 'DUP-idx'}` +
-                            ` quiet=${quietMs}ms hold=${holdMs}ms` +
                             ` recv=${receivedChunks.size}` +
                             (totalHint ? `/${totalHint}` : '')
                         );
                     } else if (label) {
                         console.log(
                             `[scan] HIT chunk=${label} frame=#${item.id}` +
-                            ` ${ms.toFixed(1)}ms quiet=${quietMs}ms hold=${holdMs}ms`
+                            ` ${ms.toFixed(1)}ms`
                         );
                     }
                     handleScanResult(text);
@@ -818,12 +795,6 @@ function startScanLoop(video) {
             return;
         }
         lastSampleAt = now;
-
-        // HIT 后静默 / 同码锁定：给发送端换码时间，避免 DUP 占满解码
-        if (now < quietUntil || now < sameTextHoldUntil) {
-            qStats.dropQuiet = (qStats.dropQuiet || 0) + 1;
-            return;
-        }
 
         const queueMax = Math.max(1, SCAN_TUNING.queueMax | 0);
         if (frameQueue.length >= queueMax) {
@@ -874,10 +845,7 @@ function startScanLoop(video) {
             queueMax: SCAN_TUNING.queueMax,
             sampleIntervalMs: SCAN_TUNING.sampleIntervalMs,
             frameDedupe: SCAN_TUNING.frameDedupe,
-            quietAfterHitMs: SCAN_TUNING.quietAfterHitMs,
-            sameTextHoldMs: SCAN_TUNING.sameTextHoldMs,
             decodeMaxEdge: SCAN_TUNING.decodeMaxEdge,
-            targetIntervalMs: SCAN_TUNING.targetIntervalMs,
             poolSize: decodeWorkers.length,
             workerReady: decodeWorkerReady,
             inflightLimit: currentInflightLimit(),
@@ -892,7 +860,7 @@ function startScanLoop(video) {
     }
     console.log(
         '[scan] 运行时可调: window.QRSyncScanTuning.' +
-        '{workerInflight,queueMax,sampleIntervalMs,frameDedupe,quietAfterHitMs,sameTextHoldMs,decodeMaxEdge,targetIntervalMs}'
+        '{workerInflight,queueMax,sampleIntervalMs,frameDedupe,decodeMaxEdge}'
     );
     console.log('[scan] 请关注日志: HIT chunk= / MISS / fpChange / progress gapsBeforeMax= / SESSION');
 
@@ -944,8 +912,7 @@ function stopScanLoop() {
             ` max=${DECODE_TIMING.max.toFixed(1)}ms` +
             ` hit=${DECODE_TIMING.hit}` +
             ` miss=${DECODE_TIMING.miss}` +
-            ` suggest≥${Math.ceil(avg / workers)}ms` +
-            ` target=${SCAN_TUNING.targetIntervalMs}ms`
+            ` suggest≥${Math.ceil(avg / workers)}ms`
         );
     }
     cropCanvas = null;
