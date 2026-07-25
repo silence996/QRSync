@@ -29,12 +29,14 @@ let zxingUseHardMode = false;
 let imageQueue = [];
 let currentImageIndex = -1;
 
-/** 高帧采样 + 多 Worker，尽量在 100ms 展示窗内完成多次尝试 */
+/** 高帧采样 + 多 Worker，尽量在短展示窗内完成多次尝试 */
 const SCAN_FPS = 60;
-const DECODE_MAX_EDGE = 720;
+const DECODE_MAX_EDGE = 560;
 const DECODE_WORKER_COUNT = 3;
-/** 相同内容去抖；100ms 连播时不同分片不受影响 */
+/** 相同内容去抖；连播时不同分片不受影响 */
 const SAME_TEXT_DEBOUNCE_MS = 80;
+/** 命中后短暂停投帧，避免 3 个 Worker 重复解同一张 QR */
+const POST_HIT_COOLDOWN_MS = 70;
 
 const DB = localforage.createInstance({ name: 'qrcode-receiver-v2' });
 
@@ -230,7 +232,7 @@ function getZXingOptions(forceHard) {
     }
     return {
         formats: ['QRCode'],
-        tryHarder: true,
+        tryHarder: false,
         tryRotate: false,
         tryInvert: false,
         tryDownscale: false,
@@ -319,22 +321,48 @@ function captureFrame(video) {
 }
 
 function startScanLoop(video) {
-    /** 并行解码数上限 = Worker 数；忙时只保留最新帧，适配 100ms 连播 */
-    const maxInflight = Math.max(1, decodeWorkers.length || 1);
+    /**
+     * 忙时只保留最新帧；命中后 cooldown + 单路解码，把并行留给换片/未命中。
+     * 成功结果一律接受（乱序分片仍有价值）；过期未命中结果忽略，避免拖慢策略。
+     */
+    const poolSize = Math.max(1, decodeWorkers.length || 1);
     let inflight = 0;
     let queuedFrame = null;
+    let decodeSeq = 0;
+    let cooldownUntil = 0;
+    /** 连播默认单路；连续未命中再放开并行 */
+    let preferSingle = true;
+
+    function currentMaxInflight() {
+        return preferSingle ? 1 : poolSize;
+    }
 
     function runDecode(imgData) {
+        const seq = ++decodeSeq;
         inflight++;
         decodeImageData(imgData)
             .then((text) => {
-                noteDecodeResult(!!text);
-                if (text) handleScanResult(text);
+                if (text) {
+                    noteDecodeResult(true);
+                    handleScanResult(text);
+                    cooldownUntil = performance.now() + POST_HIT_COOLDOWN_MS;
+                    preferSingle = true;
+                    queuedFrame = null;
+                    return;
+                }
+                // 过期未命中：已有更新请求或待解最新帧时忽略
+                if (seq < decodeSeq || queuedFrame) return;
+                noteDecodeResult(false);
+                preferSingle = false;
             })
-            .catch(() => noteDecodeResult(false))
+            .catch(() => {
+                if (seq < decodeSeq || queuedFrame) return;
+                noteDecodeResult(false);
+                preferSingle = false;
+            })
             .finally(() => {
                 inflight--;
-                if (queuedFrame) {
+                if (queuedFrame && inflight < currentMaxInflight()) {
                     const next = queuedFrame;
                     queuedFrame = null;
                     runDecode(next);
@@ -351,6 +379,9 @@ function startScanLoop(video) {
         if (video.readyState < 2) return;
         if (!video.videoWidth || !video.videoHeight) return;
 
+        // 命中后短暂停投，避免同一张 QR 打满 Worker
+        if (now < cooldownUntil) return;
+
         let imgData;
         try {
             imgData = captureFrame(video);
@@ -358,7 +389,7 @@ function startScanLoop(video) {
             return;
         }
 
-        if (inflight >= maxInflight) {
+        if (inflight >= currentMaxInflight()) {
             queuedFrame = imgData;
             return;
         }
