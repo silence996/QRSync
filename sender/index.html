@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>QRSync - 发送端</title>
     <link rel="stylesheet" href="../shared/theme.css">
-    <link rel="stylesheet" href="sender.css?v=20260726-abc9">
+    <link rel="stylesheet" href="sender.css?v=20260726-single1">
 </head>
 <body>
     <nav>
@@ -94,7 +94,7 @@
                 <div class="interval-applied-hint" id="intervalAppliedHint">
                     ✅ 已设置为 <span id="intervalAppliedValue">500</span> ms
                 </div>
-                <p class="interval-hint">默认 500ms；每页左奇数(1,3,5…) / 右偶数(2,4,6…)，末页为文件名码</p>
+                <p class="interval-hint">默认 500ms；单码模式，每间隔切换一张二维码</p>
             </div>
 
             <div class="progress-section">
@@ -136,9 +136,9 @@
             </div>
 
             <div class="qr-controls">
-                <button class="qr-nav-btn" id="prevBtn">← 上一页</button>
+                <button class="qr-nav-btn" id="prevBtn">← 上一张</button>
                 <button class="qr-nav-btn" id="playBtn">▶ 播放</button>
-                <button class="qr-nav-btn" id="nextBtn">下一页 →</button>
+                <button class="qr-nav-btn" id="nextBtn">下一张 →</button>
                 <button class="qr-nav-btn" id="fullscreenBtn" type="button">⛶ 整屏展示</button>
             </div>
 
@@ -192,8 +192,8 @@
     <script src="../js/qrcode.min.js"></script>
     <script src="../js/jszip.min.js"></script>
     <!-- 共享工具函数 -->
-    <script src="../shared/utils.js?v=20260726-abc9"></script>
+    <script src="../shared/utils.js?v=20260726-single1"></script>
     <!-- 发送端逻辑 -->
-    <script src="sender.js?v=20260726-abc9"></script>
+    <script src="sender.js?v=20260726-single1"></script>
 </body>
 </html>

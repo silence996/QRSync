@@ -106,7 +106,7 @@ async function ensureDecodeWorkerScriptUrl() {
         }
 
         if (!window.__QRSyncDecodeWorkerSource) {
-            await loadScriptOnce('decode-worker-source.js?v=20260726-abc10');
+            await loadScriptOnce('decode-worker-source.js?v=20260726-single1');
         }
         const source = window.__QRSyncDecodeWorkerSource;
         if (!source || typeof source !== 'string') {
@@ -333,7 +333,7 @@ function prepareImageDataForDecode(imgData) {
 }
 
 function getZXingOptions(forceHard) {
-    // 连播场景优先快路径；横向双码最多 2；BINARY 避免把载荷当 UTF-8
+    // 单码连播；BINARY 避免把载荷当 UTF-8
     if (forceHard) {
         return {
             formats: ['QRCode'],
@@ -341,7 +341,7 @@ function getZXingOptions(forceHard) {
             tryRotate: true,
             tryInvert: true,
             tryDownscale: false,
-            maxNumberOfSymbols: 2,
+            maxNumberOfSymbols: 1,
             characterSet: 'BINARY',
             allowJsQR: true
         };
@@ -352,7 +352,7 @@ function getZXingOptions(forceHard) {
         tryRotate: false,
         tryInvert: false,
         tryDownscale: false,
-        maxNumberOfSymbols: 2,
+        maxNumberOfSymbols: 1,
         characterSet: 'BINARY',
         allowJsQR: false
     };
@@ -448,7 +448,7 @@ function formatResolutionLabel(actual) {
     return `${actual.width}×${actual.height} ${tag}`;
 }
 
-// 全幅采帧（保留横向双码）；decodeMaxEdge=0 时按摄像头原生分辨率，不降采样
+// 单码：裁中心正方形；decodeMaxEdge=0 时按原生边长不降采样
 function captureFrame(video) {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
@@ -456,22 +456,20 @@ function captureFrame(video) {
         return new ImageData(1, 1);
     }
 
+    const srcSize = Math.min(vw, vh);
+    const sx = Math.round((vw - srcSize) / 2);
+    const sy = Math.round((vh - srcSize) / 2);
+
     const maxEdge = getDecodeMaxEdge();
-    let dw = vw;
-    let dh = vh;
-    if (maxEdge > 0) {
-        const scale = Math.min(1, maxEdge / Math.max(vw, vh));
-        dw = Math.max(1, Math.round(vw * scale));
-        dh = Math.max(1, Math.round(vh * scale));
-    }
+    const dstSize = maxEdge > 0 ? Math.min(srcSize, maxEdge) : srcSize;
 
     ensureCropCanvas();
-    resizeCanvas(cropCanvas, dw, dh);
-    const scaled = dw !== vw || dh !== vh;
+    resizeCanvas(cropCanvas, dstSize, dstSize);
+    const scaled = dstSize < srcSize;
     cropCtx.imageSmoothingEnabled = scaled;
     if (scaled) cropCtx.imageSmoothingQuality = 'high';
-    cropCtx.drawImage(video, 0, 0, vw, vh, 0, 0, dw, dh);
-    return cropCtx.getImageData(0, 0, dw, dh);
+    cropCtx.drawImage(video, sx, sy, srcSize, srcSize, 0, 0, dstSize, dstSize);
+    return cropCtx.getImageData(0, 0, dstSize, dstSize);
 }
 
 /** 廉价帧指纹，用于入队去重（粗量化，抑制相机噪声假换码） */
@@ -485,24 +483,6 @@ function frameFingerprint(imgData) {
         h = (Math.imul(h, 31) + (d[i] >> 3)) | 0;
     }
     return h;
-}
-
-/** 轻量：判断本包是否尚未入库（用于双码页部分命中时是否允许同画面重扫） */
-function isNewPacketForScan(text) {
-    if (!text) return false;
-    try {
-        const p = unpackQRPacket(text);
-        if (p) {
-            if (p.type === 'fn') {
-                return !fileInfo || fileInfo.filename === '未知文件';
-            }
-            return !receivedChunks.has(p.i);
-        }
-        const chunk = JSON.parse(text.trim());
-        if (chunk.t === 'fn') return !fileInfo || fileInfo.filename === '未知文件';
-        if (typeof chunk.i === 'number') return !receivedChunks.has(chunk.i);
-    } catch (_) {}
-    return true;
 }
 
 function startScanLoop(video) {
@@ -545,28 +525,19 @@ function startScanLoop(video) {
                         seenTxt.add(t);
                         uniq.push(t);
                     }
-                    const frameKey = uniq.slice().sort().join('\0');
-                    if (lastHitFrameKey && frameKey === lastHitFrameKey) {
+                    const text = uniq[0];
+                    if (!text) return;
+
+                    if (lastHitFrameKey && text === lastHitFrameKey) {
                         lastHitFp = item.fp;
                         frameQueue.length = 0;
                         return;
                     }
 
-                    let anyNew = false;
-                    for (let i = 0; i < uniq.length; i++) {
-                        if (isNewPacketForScan(uniq[i])) anyNew = true;
-                        handleScanResult(uniq[i]);
-                    }
-
-                    lastHitFrameKey = frameKey;
-
-                    // 双码页：收齐 2 或本帧无新分片时抑制同画面，避免漏码后无法重扫
-                    if (uniq.length >= 2 || !anyNew) {
-                        lastHitFp = item.fp;
-                        frameQueue.length = 0;
-                    } else {
-                        lastHitFp = null;
-                    }
+                    handleScanResult(text);
+                    lastHitFrameKey = text;
+                    lastHitFp = item.fp;
+                    frameQueue.length = 0;
                 })
                 .catch(() => {})
                 .finally(() => {

@@ -8,9 +8,7 @@ const CONFIG = {
     CHUNK_SIZE: DEFAULT_CHUNK_SIZE,
     QR_SIZE: DEFAULT_QR_SIZE,
     QR_MAX_CAPACITY: typeof QR_MAX_BYTES_L40 === 'number' ? QR_MAX_BYTES_L40 : 2953,
-    /** 同屏：横向双码；左=奇数分片(1,3,5…) 右=偶数(2,4,6…) */
-    GRID_COLS: 2,
-    GRID_ROWS: 1,
+    /** 同屏单码（可靠性优先） */
     AUTOPLAY_INTERVAL: DEFAULT_AUTOPLAY_INTERVAL,
     PACKET_TYPES: { DATA: 'data', FILENAME: 'fn' }
 };
@@ -252,9 +250,7 @@ async function generateQRCodeSequence() {
 
     generateBtn.disabled = false;
     generateBtn.innerHTML = '<span>生成二维码</span>';
-    showToast(
-        '二维码生成完成（左奇数 / 右偶数）；已进入整屏，Esc 退出'
-    );
+    showToast('二维码生成完成（单码模式）；已进入整屏，Esc 退出');
     enterQrImmersive();
 }
 
@@ -314,26 +310,22 @@ function updateGapStatus() {
     const el = document.getElementById('gapJumpStatus');
     if (!el) return;
     if (!gapList.length) {
-        el.textContent = highlightChunk1
-            ? ('当前目标 #' + highlightChunk1 + (highlightChunk1 % 2 ? ' 左' : ' 右'))
-            : '';
+        el.textContent = highlightChunk1 ? ('当前目标 #' + highlightChunk1) : '';
         return;
     }
     el.textContent =
         '缺口 ' + (gapCursor + 1) + '/' + gapList.length +
-        ' → #' + gapList[gapCursor] +
-        (gapList[gapCursor] % 2 ? ' 左' : ' 右');
+        ' → #' + gapList[gapCursor];
 }
 
 function applyTargetHighlight() {
     const root = document.getElementById('qrcode');
     if (!root) return;
-    const cells = root.querySelectorAll('.qr-grid-cell');
-    for (let i = 0; i < cells.length; i++) cells[i].classList.remove('qr-target');
-    if (!highlightChunk1 || highlightChunk1 < 1) return;
-    // 数据页：左=奇数，右=偶数
-    const side = (highlightChunk1 % 2 === 1) ? 0 : 1;
-    if (cells[side]) cells[side].classList.add('qr-target');
+    const cell = root.querySelector('.qr-grid-cell');
+    if (!cell) return;
+    const q = qrCodes[currentChunkIndex];
+    const match = !!(highlightChunk1 && q && q.data && (q.data.i + 1) === highlightChunk1);
+    cell.classList.toggle('qr-target', match);
 }
 
 /** 按 1-based 数据分片号跳到对应页，并高亮所在侧 */
@@ -401,28 +393,13 @@ chunkJumpInput.addEventListener('keydown', (e) => {
     }
 });
 
-/** 数据页数（每页一对：奇数|偶数）；另加 1 页文件名（若有） */
-function dataPageCount() {
-    return Math.max(0, Math.ceil(chunks.length / 2));
-}
-
+/** 一码一页：页码 = qrCodes 下标 */
 function pageCount() {
-    const dataPages = dataPageCount();
-    const fnExtra = (fileNameQrCode || (qrCodes.length > chunks.length)) ? 1 : 0;
-    return Math.max(1, dataPages + fnExtra);
+    return Math.max(1, qrCodes.length);
 }
 
-/** qrCodes 下标 → 页码；数据按对分页，文件名独占末页 */
 function pageOfIndex(index) {
-    const i = Math.max(0, index | 0);
-    if (i >= chunks.length) return Math.max(0, pageCount() - 1);
-    return Math.floor(i / 2);
-}
-
-/** 数据页 p → 左/右数据下标（0-based）；右可能越界 */
-function dataPairIndices(page) {
-    const left = page * 2;
-    return { left, right: left + 1 };
+    return Math.max(0, Math.min(index | 0, Math.max(0, qrCodes.length - 1)));
 }
 
 function clearQRCanvasCache() {
@@ -466,16 +443,9 @@ function pruneQRCanvasCache(center) {
         return;
     }
     const keep = new Set();
-    const page = pageOfIndex(center);
-    for (let p = page - 1; p <= page + 1; p++) {
-        if (p < 0 || p >= pageCount()) continue;
-        if (p >= dataPageCount()) {
-            if (chunks.length < total) keep.add(chunks.length);
-            continue;
-        }
-        const { left, right } = dataPairIndices(p);
-        if (left < total) keep.add(left);
-        if (right < chunks.length) keep.add(right);
+    const c = Math.max(0, center | 0);
+    for (let i = c - 2; i <= c + QR_PRERENDER_AHEAD; i++) {
+        if (i >= 0 && i < total) keep.add(i);
     }
     for (const key of [...qrCanvasCache.keys()]) {
         if (!keep.has(key)) qrCanvasCache.delete(key);
@@ -489,20 +459,10 @@ function schedulePrerenderAround(index) {
     const run = () => {
         prerenderScheduled = false;
         if (!qrCodes.length) return;
-        const nextPage = pageOfIndex(index) + 1;
-        if (nextPage >= pageCount()) return;
-        const toPrep = [];
-        if (nextPage >= dataPageCount()) {
-            if (chunks.length < qrCodes.length) toPrep.push(chunks.length);
-        } else {
-            const { left, right } = dataPairIndices(nextPage);
-            toPrep.push(left);
-            if (right < chunks.length) toPrep.push(right);
-        }
-        for (let i = 0; i < toPrep.length; i++) {
-            const idx = toPrep[i];
-            if (!qrCanvasCache.has(idx)) {
-                getCachedQRCanvas(idx);
+        const start = Math.max(0, (index | 0) + 1);
+        for (let i = start; i < Math.min(start + QR_PRERENDER_AHEAD, qrCodes.length); i++) {
+            if (!qrCanvasCache.has(i)) {
+                getCachedQRCanvas(i);
                 prerenderScheduled = true;
                 setTimeout(run, 0);
                 return;
@@ -518,86 +478,75 @@ function ensureQRCanvasReady(index) {
     return getCachedQRCanvas(index);
 }
 
-/** 按页展示：数据页左奇数/右偶数；末页为文件名码 */
+/** 展示单个二维码（一码一页） */
 function showQRPage(pageIndex) {
     const pages = pageCount();
-    const dataPages = dataPageCount();
     const page = Math.max(0, Math.min(pageIndex, pages - 1));
-    const isFnPage = page >= dataPages;
+    currentChunkIndex = page;
 
     let qrEl = document.getElementById('qrcode');
     if (!qrEl) {
         qrContainer.innerHTML = '<div id="qrcode"></div>';
         qrEl = document.getElementById('qrcode');
     }
-    qrEl.className = 'qr-grid-inner qr-grid-row';
-    qrEl.style.gridTemplateColumns = '1fr 1fr';
+    qrEl.className = 'qr-grid-inner qr-single';
+    qrEl.style.gridTemplateColumns = '1fr';
     while (qrEl.firstChild) qrEl.removeChild(qrEl.firstChild);
 
-    const labels = [];
-    let cacheAnchor = 0;
+    const q = qrCodes[page];
+    const isFn = q && q.type === CONFIG.PACKET_TYPES.FILENAME;
+    qrContainer.className = isFn
+        ? 'qr-container filename-qr'
+        : 'qr-container data-qr';
 
-    function appendCell(qrIndex, sideClass) {
-        const cell = document.createElement('div');
-        cell.className = 'qr-grid-cell' + (sideClass ? ' ' + sideClass : '');
-        if (qrIndex != null && qrIndex >= 0 && qrIndex < qrCodes.length) {
-            const canvas = ensureQRCanvasReady(qrIndex);
-            if (canvas) {
-                const clone = document.createElement('canvas');
-                clone.width = canvas.width;
-                clone.height = canvas.height;
-                clone.getContext('2d').drawImage(canvas, 0, 0);
-                cell.appendChild(clone);
-            }
-            const q = qrCodes[qrIndex];
-            if (q.type === CONFIG.PACKET_TYPES.FILENAME) {
-                labels.push('fn');
-            } else {
-                const i = (q.data && q.data.i != null) ? q.data.i : qrIndex;
-                const t = (q.data && q.data.t != null) ? q.data.t : chunks.length;
-                labels.push((i + 1) + '/' + t);
-            }
-        } else {
-            cell.classList.add('empty');
-            labels.push('-');
+    const cell = document.createElement('div');
+    cell.className = 'qr-grid-cell';
+    if (q) {
+        const canvas = ensureQRCanvasReady(page);
+        if (canvas) {
+            const clone = document.createElement('canvas');
+            clone.width = canvas.width;
+            clone.height = canvas.height;
+            clone.getContext('2d').drawImage(canvas, 0, 0);
+            cell.appendChild(clone);
         }
-        qrEl.appendChild(cell);
-    }
-
-    if (isFnPage) {
-        const fnIndex = chunks.length; // generateQRCodeSequence 把 fn 接在数据后
-        currentChunkIndex = fnIndex;
-        cacheAnchor = fnIndex;
-        qrContainer.className = 'qr-container filename-qr qr-grid';
-        appendCell(fnIndex < qrCodes.length ? fnIndex : null, 'qr-side-left');
-        appendCell(null, 'qr-side-right');
-        document.getElementById('qrCounter').textContent =
-            `页 ${page + 1}/${pages} · 文件名码`;
-        document.getElementById('qrHint').textContent =
-            '⚠️ 本页为文件名码（左），请扫描；右为空';
     } else {
-        const { left, right } = dataPairIndices(page);
-        currentChunkIndex = left;
-        cacheAnchor = left;
-        qrContainer.className = 'qr-container data-qr qr-grid';
-        appendCell(left < qrCodes.length ? left : null, 'qr-side-left');
-        appendCell(right < chunks.length ? right : null, 'qr-side-right');
-        const leftNo = left + 1;
-        const rightNo = right < chunks.length ? (right + 1) : null;
-        document.getElementById('qrCounter').textContent = rightNo != null
-            ? `页 ${page + 1}/${pages} · 左 ${leftNo} · 右 ${rightNo}`
-            : `页 ${page + 1}/${pages} · 左 ${leftNo} · 右 —`;
+        cell.classList.add('empty');
+    }
+    qrEl.appendChild(cell);
+
+    let label = '';
+    if (isFn) {
+        label = '文件名码';
+        document.getElementById('qrCounter').textContent =
+            `${page + 1} / ${pages} · 文件名`;
         document.getElementById('qrHint').textContent =
-            '左=奇数分片，右=偶数分片；请对准整页扫描';
+            '⚠️ 请扫描文件名二维码';
+    } else if (q) {
+        const i = (q.data && q.data.i != null) ? q.data.i : page;
+        const t = (q.data && q.data.t != null) ? q.data.t : chunks.length;
+        label = (i + 1) + '/' + t;
+        document.getElementById('qrCounter').textContent =
+            `${page + 1} / ${pages} · 分片 ${label}`;
+        document.getElementById('qrHint').textContent =
+            '单码模式：请对准扫描框扫描';
+    } else {
+        document.getElementById('qrCounter').textContent = `${page + 1} / ${pages}`;
+        document.getElementById('qrHint').textContent = '';
     }
 
     const qrType = document.getElementById('qrType');
-    qrType.textContent = labels.length ? ('本页: ' + labels.join(' | ')) : '空页';
-    qrType.className = 'qr-type ' + (isFnPage ? 'filename' : 'data');
+    qrType.textContent = label || '空';
+    qrType.className = 'qr-type ' + (isFn ? 'filename' : 'data');
+
+    // 跳转高亮：当前数据分片匹配目标时描边
+    if (isFn || !q || !q.data || (q.data.i + 1) !== highlightChunk1) {
+        if (isFn) highlightChunk1 = 0;
+    }
 
     updateJumpControls(currentChunkIndex);
-    pruneQRCanvasCache(cacheAnchor);
-    schedulePrerenderAround(cacheAnchor);
+    pruneQRCanvasCache(currentChunkIndex);
+    schedulePrerenderAround(currentChunkIndex);
     applyTargetHighlight();
 }
 
@@ -710,7 +659,7 @@ function clearAutoplayTimer() {
     }
 }
 
-/** 按页播放：每间隔翻一页（默认横向双码） */
+/** 按码播放：每间隔翻一个二维码 */
 function scheduleNextAutoplay() {
     clearAutoplayTimer();
     if (!isPlaying || !qrCodes.length) return;
@@ -720,21 +669,13 @@ function scheduleNextAutoplay() {
     autoplayTimer = setTimeout(() => {
         autoplayTimer = null;
         if (!isPlaying || !qrCodes.length) return;
-        const p = pageOfIndex(currentChunkIndex);
-        const next = p + 1;
-        if (next >= pageCount()) {
+        const next = currentChunkIndex + 1;
+        if (next >= qrCodes.length) {
             stopAutoplay();
             showToast('播放完成');
             return;
         }
-        const nextIndex = next >= dataPageCount()
-            ? chunks.length
-            : dataPairIndices(next).left;
-        ensureQRCanvasReady(nextIndex);
-        if (next < dataPageCount()) {
-            const r = dataPairIndices(next).right;
-            if (r < chunks.length) ensureQRCanvasReady(r);
-        }
+        ensureQRCanvasReady(next);
         showQRPage(next);
         scheduleNextAutoplay();
     }, CONFIG.AUTOPLAY_INTERVAL);
