@@ -43,6 +43,11 @@ const SCAN_TUNING = {
      * false = 完全不去重
      */
     frameDedupe: true,
+    /**
+     * HIT 后静默 ms：清空排队帧并暂停入队，避免同一张码 DUP 占满 Worker，
+     * 把算力留给下一张。建议约为 targetInterval 的 40%～60%。
+     */
+    quietAfterHitMs: 50,
     /** 解码边长上限 */
     decodeMaxEdge: 560,
     /** 目标播放间隔（仅用于日志对照） */
@@ -102,7 +107,7 @@ async function ensureDecodeWorkerScriptUrl() {
         console.log('[decode-worker] file:// 模式：加载 decode-worker-source.js → Blob Worker');
         const t0 = performance.now();
         if (!window.__QRSyncDecodeWorkerSource) {
-            await loadScriptOnce('decode-worker-source.js?v=20260726-log3');
+            await loadScriptOnce('decode-worker-source.js?v=20260726-quiet1');
         }
         const source = window.__QRSyncDecodeWorkerSource;
         if (!source || typeof source !== 'string') {
@@ -557,21 +562,28 @@ function peekChunkMeta(text) {
 }
 
 function formatChunkGaps(receivedSet, totalHint) {
-    if (!receivedSet.size && !(totalHint > 0)) return { got: '-', missing: '-', gotCount: 0, missCount: 0 };
-    const maxIdx = Math.max(
-        totalHint > 0 ? totalHint - 1 : 0,
-        ...(receivedSet.size ? receivedSet : [0])
-    );
+    if (!receivedSet.size) {
+        return { got: '-', missing: '-', gotCount: 0, missCount: 0, missingMore: 0 };
+    }
+    const gotArr = [...receivedSet].sort((a, b) => a - b);
+    const maxGot = gotArr[gotArr.length - 1];
+    // 只统计「已见到的最大编号」之前的缺口，避免 total=数万时刷爆控制台
+    const scanTo = maxGot;
     const missing = [];
-    for (let i = 0; i <= maxIdx; i++) {
+    for (let i = 0; i <= scanTo; i++) {
         if (!receivedSet.has(i)) missing.push(i + 1);
     }
-    const got = [...receivedSet].sort((a, b) => a - b).map(i => i + 1);
+    const MAX_SHOW = 40;
+    const shown = missing.slice(0, MAX_SHOW);
+    const more = Math.max(0, missing.length - shown.length);
+    const ahead = totalHint > 0 ? Math.max(0, totalHint - 1 - maxGot) : 0;
     return {
-        got: got.join(',') || '-',
-        missing: missing.length ? missing.join(',') : '-',
-        gotCount: got.length,
-        missCount: missing.length
+        got: gotArr.map(i => i + 1).join(','),
+        missing: shown.length ? shown.join(',') : '-',
+        gotCount: gotArr.length,
+        missCount: missing.length,
+        missingMore: more,
+        ahead
     };
 }
 
@@ -591,7 +603,9 @@ function startScanLoop(video) {
     let lastSampleAt = 0;
     /** 仅在 HIT 后抑制同指纹；MISS 允许同画面再入队重试 */
     let lastHitFp = null;
+    let lastHitText = null;
     let lastEnqueuedFp = null;
+    let quietUntil = 0;
     let missStreak = 0;
     let hitStreak = 0;
     /** 本轮扫描解码到的分片（含重复 HIT） */
@@ -610,7 +624,8 @@ function startScanLoop(video) {
         newChunk: 0,
         dupChunk: 0,
         fpChange: 0,
-        fpRetry: 0
+        fpRetry: 0,
+        dropQuiet: 0
     };
     let lastStatsLogAt = 0;
 
@@ -624,14 +639,16 @@ function startScanLoop(video) {
     }
 
     function logRecvSnapshot(tag) {
-        const gaps = formatChunkGaps(receivedChunks.size ? new Set(receivedChunks.keys()) : seenChunkIdx, totalHint);
+        const gaps = formatChunkGaps(new Set(receivedChunks.keys()), totalHint || fileInfo?.totalChunks || 0);
         console.log(
             `[scan] ${tag}` +
             ` recv=${receivedChunks.size}` +
             (totalHint ? `/${totalHint}` : '') +
             ` got=[${gaps.got}]` +
-            ` missing=[${gaps.missing}]` +
-            ` missCount=${gaps.missCount}` +
+            ` gapsBeforeMax=[${gaps.missing}]` +
+            (gaps.missingMore ? ` +${gaps.missingMore}more` : '') +
+            ` gapCount=${gaps.missCount}` +
+            (gaps.ahead ? ` stillAhead≈${gaps.ahead}` : '') +
             ` elapsed=${(performance.now() - sessionStart).toFixed(0)}ms`
         );
     }
@@ -653,6 +670,7 @@ function startScanLoop(video) {
             ` pool=${decodeWorkers.length}` +
             ` enq=${qStats.enqueued} deq=${qStats.dequeued}` +
             ` dropFull=${qStats.dropFull} dropDedupe=${qStats.dropDedupe}` +
+            ` dropQuiet=${qStats.dropQuiet || 0}` +
             ` hit=${qStats.hit} miss=${qStats.miss} hitRate=${hitRate}%` +
             ` new=${qStats.newChunk} dup=${qStats.dupChunk}` +
             ` fpChange=${qStats.fpChange} fpRetry=${qStats.fpRetry}` +
@@ -685,6 +703,13 @@ function startScanLoop(video) {
                 .then((text) => {
                     const ms = performance.now() - tDecode0;
                     if (text) {
+                        const quietMs = Math.max(0, SCAN_TUNING.quietAfterHitMs | 0);
+                        quietUntil = performance.now() + quietMs;
+                        // 丢掉仍在排队的旧帧，避免继续 DUP 同一张
+                        if (frameQueue.length) {
+                            qStats.dropQuiet = (qStats.dropQuiet || 0) + frameQueue.length;
+                            frameQueue.length = 0;
+                        }
                         lastHitFp = item.fp;
                         missStreak = 0;
                         hitStreak++;
@@ -692,6 +717,8 @@ function startScanLoop(video) {
                         noteDecodeResult(true);
                         const meta = peekChunkMeta(text);
                         const label = peekChunkLabel(text);
+                        const isDupText = text === lastHitText;
+                        lastHitText = text;
                         if (meta && meta.kind === 'data') {
                             if (meta.t) totalHint = meta.t;
                             const isNew = !seenChunkIdx.has(meta.i);
@@ -706,14 +733,17 @@ function startScanLoop(video) {
                                 ` frame=#${item.id}` +
                                 ` ${ms.toFixed(1)}ms` +
                                 ` ${isNew ? 'NEW' : 'DUP'}` +
+                                (isDupText ? ' sameText' : '') +
+                                ` quiet=${quietMs}ms` +
                                 ` hitStreak=${hitStreak}` +
                                 ` recv=${receivedChunks.size}` +
                                 (totalHint ? `/${totalHint}` : '')
                             );
                         } else if (label) {
-                            console.log(`[scan] HIT chunk=${label} frame=#${item.id} ${ms.toFixed(1)}ms`);
+                            console.log(`[scan] HIT chunk=${label} frame=#${item.id} ${ms.toFixed(1)}ms quiet=${quietMs}ms`);
                         }
-                        handleScanResult(text);
+                        // 相同文本不必再走业务处理（去抖也会挡，这里省一点）
+                        if (!isDupText) handleScanResult(text);
                     } else {
                         // MISS：不更新 lastHitFp，允许同指纹再入队重试
                         hitStreak = 0;
@@ -750,6 +780,12 @@ function startScanLoop(video) {
             return;
         }
         lastSampleAt = now;
+
+        // HIT 后静默：给发送端换码时间，避免 DUP 占满解码
+        if (now < quietUntil) {
+            qStats.dropQuiet = (qStats.dropQuiet || 0) + 1;
+            return;
+        }
 
         const queueMax = Math.max(1, SCAN_TUNING.queueMax | 0);
         if (frameQueue.length >= queueMax) {
@@ -800,6 +836,7 @@ function startScanLoop(video) {
             queueMax: SCAN_TUNING.queueMax,
             sampleIntervalMs: SCAN_TUNING.sampleIntervalMs,
             frameDedupe: SCAN_TUNING.frameDedupe,
+            quietAfterHitMs: SCAN_TUNING.quietAfterHitMs,
             decodeMaxEdge: SCAN_TUNING.decodeMaxEdge,
             targetIntervalMs: SCAN_TUNING.targetIntervalMs,
             poolSize: decodeWorkers.length,
@@ -816,9 +853,9 @@ function startScanLoop(video) {
     }
     console.log(
         '[scan] 运行时可调: window.QRSyncScanTuning.' +
-        '{workerInflight,queueMax,sampleIntervalMs,frameDedupe,decodeMaxEdge,targetIntervalMs}'
+        '{workerInflight,queueMax,sampleIntervalMs,frameDedupe,quietAfterHitMs,decodeMaxEdge,targetIntervalMs}'
     );
-    console.log('[scan] 请关注日志: HIT chunk= / MISS / fpChange / progress missing= / SESSION');
+    console.log('[scan] 请关注日志: HIT chunk= / MISS / fpChange / progress gapsBeforeMax= / SESSION');
 
     _scanSessionDump = () => {
         logScanStats(true);
