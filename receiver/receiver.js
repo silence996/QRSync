@@ -774,12 +774,38 @@ function showCameraStatus(message, type) {
     el.className = 'status-message show status-' + type;
 }
 
+let _floatingEl = null;
+let _floatingTimer = null;
+let _floatingLastMsg = '';
+let _floatingLastAt = 0;
+const FLOATING_DEDUPE_MS = 1800;
+
 function showFloatingMessage(message, isError = false) {
+    const now = Date.now();
+    // 相同文案短时去抖，避免已接收分片连扫时叠层/狂闪
+    if (message === _floatingLastMsg && now - _floatingLastAt < FLOATING_DEDUPE_MS) {
+        return;
+    }
+    _floatingLastMsg = message;
+    _floatingLastAt = now;
+
+    if (_floatingEl) {
+        clearTimeout(_floatingTimer);
+        _floatingEl.remove();
+        _floatingEl = null;
+    }
+
     const msg = document.createElement('div');
     msg.className = 'floating-message' + (isError ? ' floating-error' : '');
     msg.textContent = message;
     document.body.appendChild(msg);
-    setTimeout(() => msg.remove(), 2800);
+    _floatingEl = msg;
+    _floatingTimer = setTimeout(() => {
+        if (_floatingEl === msg) {
+            msg.remove();
+            _floatingEl = null;
+        }
+    }, 2800);
 }
 
 function updateUI() {
