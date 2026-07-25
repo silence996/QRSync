@@ -1,13 +1,17 @@
 // ===== 配置 =====
+const DEFAULT_CHUNK_SIZE = 2900;
+const DEFAULT_QR_SIZE = 1600;
+const DEFAULT_AUTOPLAY_INTERVAL = 500;
+
 const CONFIG = {
-    /** Q3 二进制：20 字节头 + 载荷 ≤ 2953 → 载荷上限约 2933；默认留余量 */
-    CHUNK_SIZE: 2800,
-    QR_SIZE: 900,
+    /** Q3 二进制：20 字节头 + 载荷 ≤ 2953 → 载荷上限约 2933；默认拉满滑块 */
+    CHUNK_SIZE: DEFAULT_CHUNK_SIZE,
+    QR_SIZE: DEFAULT_QR_SIZE,
     QR_MAX_CAPACITY: typeof QR_MAX_BYTES_L40 === 'number' ? QR_MAX_BYTES_L40 : 2953,
-    /** 同屏：横向双码（1 行 × 2 列，竖屏更易放下） */
+    /** 同屏：横向双码；左=奇数分片(1,3,5…) 右=偶数(2,4,6…) */
     GRID_COLS: 2,
     GRID_ROWS: 1,
-    AUTOPLAY_INTERVAL: 500,
+    AUTOPLAY_INTERVAL: DEFAULT_AUTOPLAY_INTERVAL,
     PACKET_TYPES: { DATA: 'data', FILENAME: 'fn' }
 };
 
@@ -249,45 +253,177 @@ async function generateQRCodeSequence() {
     generateBtn.disabled = false;
     generateBtn.innerHTML = '<span>生成二维码</span>';
     showToast(
-        '二维码生成完成（Q3 二进制 + 横向 ' +
-        CONFIG.GRID_COLS + ' 码/页）'
+        '二维码生成完成（左奇数 / 右偶数）；已进入整屏，Esc 退出'
     );
-    qrSection.scrollIntoView({ behavior: 'smooth' });
+    enterQrImmersive();
 }
 
 function updateJumpControls(index) {
-    const total = qrCodes.length;
-    chunkJumpInput.max = String(Math.max(total, 1));
-    chunkJumpInput.value = String(index + 1);
+    // 不覆盖用户正在输入的缺口列表；仅刷新可选范围提示
+    if (!chunks.length) return;
+    chunkJumpInput.setAttribute('data-max', String(chunks.length));
+    if (!chunkJumpInput.value.trim() && index < chunks.length) {
+        chunkJumpInput.placeholder = '如 ' + (index + 1) + ' 或 3,4,5-7（共 ' + chunks.length + '）';
+    }
+}
+
+/** 解析分片号：5 / 3,4,5,6,7 / 3-7 / 3~7；fn=文件名页 */
+function parseChunkRefs(str) {
+    const raw = String(str || '').trim();
+    if (!raw) return { nums: [], wantFn: false };
+    if (/^(fn|文件名)$/i.test(raw)) return { nums: [], wantFn: true };
+
+    const nums = [];
+    let wantFn = false;
+    const parts = raw.split(/[,，\s]+/).filter(Boolean);
+    for (let p = 0; p < parts.length; p++) {
+        const token = parts[p];
+        if (/^(fn|文件名)$/i.test(token)) {
+            wantFn = true;
+            continue;
+        }
+        const range = token.match(/^(\d+)\s*[-~～—–到至]\s*(\d+)$/);
+        if (range) {
+            let a = parseInt(range[1], 10);
+            let b = parseInt(range[2], 10);
+            if (a > b) { const t = a; a = b; b = t; }
+            for (let i = a; i <= b; i++) nums.push(i);
+            continue;
+        }
+        const n = parseInt(token, 10);
+        if (!isNaN(n)) nums.push(n);
+    }
+
+    const max = chunks.length;
+    const uniq = [];
+    const seen = new Set();
+    for (let i = 0; i < nums.length; i++) {
+        const n = nums[i];
+        if (n < 1 || n > max || seen.has(n)) continue;
+        seen.add(n);
+        uniq.push(n);
+    }
+    return { nums: uniq, wantFn };
+}
+
+let gapList = [];
+let gapCursor = -1;
+let highlightChunk1 = 0; // 1-based；0=无
+
+function updateGapStatus() {
+    const el = document.getElementById('gapJumpStatus');
+    if (!el) return;
+    if (!gapList.length) {
+        el.textContent = highlightChunk1
+            ? ('当前目标 #' + highlightChunk1 + (highlightChunk1 % 2 ? ' 左' : ' 右'))
+            : '';
+        return;
+    }
+    el.textContent =
+        '缺口 ' + (gapCursor + 1) + '/' + gapList.length +
+        ' → #' + gapList[gapCursor] +
+        (gapList[gapCursor] % 2 ? ' 左' : ' 右');
+}
+
+function applyTargetHighlight() {
+    const root = document.getElementById('qrcode');
+    if (!root) return;
+    const cells = root.querySelectorAll('.qr-grid-cell');
+    for (let i = 0; i < cells.length; i++) cells[i].classList.remove('qr-target');
+    if (!highlightChunk1 || highlightChunk1 < 1) return;
+    // 数据页：左=奇数，右=偶数
+    const side = (highlightChunk1 % 2 === 1) ? 0 : 1;
+    if (cells[side]) cells[side].classList.add('qr-target');
+}
+
+/** 按 1-based 数据分片号跳到对应页，并高亮所在侧 */
+function jumpToDataChunk(n1based) {
+    if (!chunks.length) return false;
+    const n = n1based | 0;
+    if (n < 1 || n > chunks.length) {
+        showToast('分片号需在 1～' + chunks.length);
+        return false;
+    }
+    stopAutoplay();
+    highlightChunk1 = n;
+    showQRPage(pageOfIndex(n - 1));
+    applyTargetHighlight();
+    updateGapStatus();
+    return true;
+}
+
+function jumpToFilenamePage() {
+    if (!qrCodes.length || qrCodes.length <= chunks.length) {
+        showToast('没有文件名码');
+        return false;
+    }
+    stopAutoplay();
+    highlightChunk1 = 0;
+    showQRPage(pageCount() - 1);
+    updateGapStatus();
+    return true;
 }
 
 function jumpToChunk() {
-    const total = qrCodes.length;
-    if (!total) return;
-    const raw = parseInt(chunkJumpInput.value, 10);
-    if (isNaN(raw) || raw < 1 || raw > total) return;
-    stopAutoplay();
-    showQRPage(pageOfIndex(raw - 1));
+    if (!chunks.length && !qrCodes.length) return;
+    const parsed = parseChunkRefs(chunkJumpInput.value);
+    if (parsed.wantFn && !parsed.nums.length) {
+        gapList = [];
+        gapCursor = -1;
+        jumpToFilenamePage();
+        return;
+    }
+    if (!parsed.nums.length) {
+        showToast('请输入分片号，例如 5 或 3,4,5-7');
+        return;
+    }
+    gapList = parsed.nums;
+    gapCursor = 0;
+    jumpToDataChunk(gapList[0]);
+    showToast('已跳到分片 #' + gapList[0] + (gapList.length > 1 ? '（共 ' + gapList.length + ' 个缺口，点「下一缺口」）' : ''));
 }
 
-function gridCells() {
-    const cols = Math.max(1, CONFIG.GRID_COLS | 0);
-    const rows = Math.max(1, CONFIG.GRID_ROWS | 0);
-    return cols * rows;
-}
-
-function pageCount() {
-    return Math.max(1, Math.ceil(qrCodes.length / gridCells()));
-}
-
-function pageOfIndex(index) {
-    return Math.floor(Math.max(0, index) / gridCells());
+function jumpNextGap() {
+    if (!gapList.length) {
+        jumpToChunk();
+        return;
+    }
+    gapCursor = (gapCursor + 1) % gapList.length;
+    jumpToDataChunk(gapList[gapCursor]);
 }
 
 chunkJumpBtn.addEventListener('click', jumpToChunk);
+document.getElementById('chunkJumpNextBtn').addEventListener('click', jumpNextGap);
 chunkJumpInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') jumpToChunk();
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        jumpToChunk();
+    }
 });
+
+/** 数据页数（每页一对：奇数|偶数）；另加 1 页文件名（若有） */
+function dataPageCount() {
+    return Math.max(0, Math.ceil(chunks.length / 2));
+}
+
+function pageCount() {
+    const dataPages = dataPageCount();
+    const fnExtra = (fileNameQrCode || (qrCodes.length > chunks.length)) ? 1 : 0;
+    return Math.max(1, dataPages + fnExtra);
+}
+
+/** qrCodes 下标 → 页码；数据按对分页，文件名独占末页 */
+function pageOfIndex(index) {
+    const i = Math.max(0, index | 0);
+    if (i >= chunks.length) return Math.max(0, pageCount() - 1);
+    return Math.floor(i / 2);
+}
+
+/** 数据页 p → 左/右数据下标（0-based）；右可能越界 */
+function dataPairIndices(page) {
+    const left = page * 2;
+    return { left, right: left + 1 };
+}
 
 function clearQRCanvasCache() {
     qrCanvasCache.clear();
@@ -330,14 +466,16 @@ function pruneQRCanvasCache(center) {
         return;
     }
     const keep = new Set();
-    const cells = gridCells();
     const page = pageOfIndex(center);
     for (let p = page - 1; p <= page + 1; p++) {
         if (p < 0 || p >= pageCount()) continue;
-        for (let k = 0; k < cells; k++) {
-            const i = p * cells + k;
-            if (i < total) keep.add(i);
+        if (p >= dataPageCount()) {
+            if (chunks.length < total) keep.add(chunks.length);
+            continue;
         }
+        const { left, right } = dataPairIndices(p);
+        if (left < total) keep.add(left);
+        if (right < chunks.length) keep.add(right);
     }
     for (const key of [...qrCanvasCache.keys()]) {
         if (!keep.has(key)) qrCanvasCache.delete(key);
@@ -351,11 +489,20 @@ function schedulePrerenderAround(index) {
     const run = () => {
         prerenderScheduled = false;
         if (!qrCodes.length) return;
-        const cells = gridCells();
-        const start = (pageOfIndex(index) + 1) * cells;
-        for (let i = start; i < Math.min(start + cells, qrCodes.length); i++) {
-            if (!qrCanvasCache.has(i)) {
-                getCachedQRCanvas(i);
+        const nextPage = pageOfIndex(index) + 1;
+        if (nextPage >= pageCount()) return;
+        const toPrep = [];
+        if (nextPage >= dataPageCount()) {
+            if (chunks.length < qrCodes.length) toPrep.push(chunks.length);
+        } else {
+            const { left, right } = dataPairIndices(nextPage);
+            toPrep.push(left);
+            if (right < chunks.length) toPrep.push(right);
+        }
+        for (let i = 0; i < toPrep.length; i++) {
+            const idx = toPrep[i];
+            if (!qrCanvasCache.has(idx)) {
+                getCachedQRCanvas(idx);
                 prerenderScheduled = true;
                 setTimeout(run, 0);
                 return;
@@ -371,19 +518,12 @@ function ensureQRCanvasReady(index) {
     return getCachedQRCanvas(index);
 }
 
-/** 按页展示 GRID_COLS×GRID_ROWS 个二维码（默认横向双码） */
+/** 按页展示：数据页左奇数/右偶数；末页为文件名码 */
 function showQRPage(pageIndex) {
-    const cells = gridCells();
     const pages = pageCount();
+    const dataPages = dataPageCount();
     const page = Math.max(0, Math.min(pageIndex, pages - 1));
-    const start = page * cells;
-    currentChunkIndex = start;
-
-    const slice = qrCodes.slice(start, start + cells);
-    const hasFilename = slice.some((q) => q && q.type === CONFIG.PACKET_TYPES.FILENAME);
-    qrContainer.className = hasFilename
-        ? 'qr-container filename-qr qr-grid'
-        : 'qr-container data-qr qr-grid';
+    const isFnPage = page >= dataPages;
 
     let qrEl = document.getElementById('qrcode');
     if (!qrEl) {
@@ -391,16 +531,17 @@ function showQRPage(pageIndex) {
         qrEl = document.getElementById('qrcode');
     }
     qrEl.className = 'qr-grid-inner qr-grid-row';
-    qrEl.style.gridTemplateColumns = 'repeat(' + Math.max(1, CONFIG.GRID_COLS | 0) + ', 1fr)';
+    qrEl.style.gridTemplateColumns = '1fr 1fr';
     while (qrEl.firstChild) qrEl.removeChild(qrEl.firstChild);
 
     const labels = [];
-    for (let k = 0; k < cells; k++) {
-        const idx = start + k;
+    let cacheAnchor = 0;
+
+    function appendCell(qrIndex, sideClass) {
         const cell = document.createElement('div');
-        cell.className = 'qr-grid-cell';
-        if (idx < qrCodes.length) {
-            const canvas = ensureQRCanvasReady(idx);
+        cell.className = 'qr-grid-cell' + (sideClass ? ' ' + sideClass : '');
+        if (qrIndex != null && qrIndex >= 0 && qrIndex < qrCodes.length) {
+            const canvas = ensureQRCanvasReady(qrIndex);
             if (canvas) {
                 const clone = document.createElement('canvas');
                 clone.width = canvas.width;
@@ -408,33 +549,56 @@ function showQRPage(pageIndex) {
                 clone.getContext('2d').drawImage(canvas, 0, 0);
                 cell.appendChild(clone);
             }
-            const q = qrCodes[idx];
+            const q = qrCodes[qrIndex];
             if (q.type === CONFIG.PACKET_TYPES.FILENAME) {
                 labels.push('fn');
             } else {
-                const i = (q.data && q.data.i != null) ? q.data.i : idx;
+                const i = (q.data && q.data.i != null) ? q.data.i : qrIndex;
                 const t = (q.data && q.data.t != null) ? q.data.t : chunks.length;
                 labels.push((i + 1) + '/' + t);
             }
         } else {
             cell.classList.add('empty');
+            labels.push('-');
         }
         qrEl.appendChild(cell);
     }
 
-    document.getElementById('qrCounter').textContent =
-        `页 ${page + 1}/${pages} · 码 ${start + 1}-${Math.min(start + cells, qrCodes.length)}/${qrCodes.length}`;
+    if (isFnPage) {
+        const fnIndex = chunks.length; // generateQRCodeSequence 把 fn 接在数据后
+        currentChunkIndex = fnIndex;
+        cacheAnchor = fnIndex;
+        qrContainer.className = 'qr-container filename-qr qr-grid';
+        appendCell(fnIndex < qrCodes.length ? fnIndex : null, 'qr-side-left');
+        appendCell(null, 'qr-side-right');
+        document.getElementById('qrCounter').textContent =
+            `页 ${page + 1}/${pages} · 文件名码`;
+        document.getElementById('qrHint').textContent =
+            '⚠️ 本页为文件名码（左），请扫描；右为空';
+    } else {
+        const { left, right } = dataPairIndices(page);
+        currentChunkIndex = left;
+        cacheAnchor = left;
+        qrContainer.className = 'qr-container data-qr qr-grid';
+        appendCell(left < qrCodes.length ? left : null, 'qr-side-left');
+        appendCell(right < chunks.length ? right : null, 'qr-side-right');
+        const leftNo = left + 1;
+        const rightNo = right < chunks.length ? (right + 1) : null;
+        document.getElementById('qrCounter').textContent = rightNo != null
+            ? `页 ${page + 1}/${pages} · 左 ${leftNo} · 右 ${rightNo}`
+            : `页 ${page + 1}/${pages} · 左 ${leftNo} · 右 —`;
+        document.getElementById('qrHint').textContent =
+            '左=奇数分片，右=偶数分片；请对准整页扫描';
+    }
 
     const qrType = document.getElementById('qrType');
-    qrType.textContent = labels.length ? ('本页: ' + labels.join(', ')) : '空页';
-    qrType.className = 'qr-type ' + (hasFilename ? 'filename' : 'data');
-    document.getElementById('qrHint').textContent = hasFilename
-        ? '⚠️ 本页含文件名码，请一并扫描'
-        : '请使用接收端对准整页网格扫描';
+    qrType.textContent = labels.length ? ('本页: ' + labels.join(' | ')) : '空页';
+    qrType.className = 'qr-type ' + (isFnPage ? 'filename' : 'data');
 
-    updateJumpControls(start);
-    pruneQRCanvasCache(start);
-    schedulePrerenderAround(start);
+    updateJumpControls(currentChunkIndex);
+    pruneQRCanvasCache(cacheAnchor);
+    schedulePrerenderAround(cacheAnchor);
+    applyTargetHighlight();
 }
 
 function showQRCode(index) {
@@ -442,16 +606,90 @@ function showQRCode(index) {
 }
 
 // ===== 导航（按页） =====
-document.getElementById('prevBtn').addEventListener('click', () => {
+function goPrevPage() {
     stopAutoplay();
     const p = pageOfIndex(currentChunkIndex);
     if (p > 0) showQRPage(p - 1);
-});
+}
 
-document.getElementById('nextBtn').addEventListener('click', () => {
+function goNextPage() {
     stopAutoplay();
     const p = pageOfIndex(currentChunkIndex);
     if (p + 1 < pageCount()) showQRPage(p + 1);
+}
+
+document.getElementById('prevBtn').addEventListener('click', goPrevPage);
+document.getElementById('nextBtn').addEventListener('click', goNextPage);
+document.getElementById('stagePrevBtn').addEventListener('click', goPrevPage);
+document.getElementById('stageNextBtn').addEventListener('click', goNextPage);
+
+// ===== 整屏沉浸（占满显示器） =====
+let qrImmersive = false;
+
+function syncPlayButtons() {
+    const label = isPlaying ? '⏸ 暂停' : '▶ 播放';
+    playBtn.textContent = label;
+    const stagePlay = document.getElementById('stagePlayBtn');
+    if (stagePlay) stagePlay.textContent = isPlaying ? '⏸' : '▶';
+    const fsBtn = document.getElementById('fullscreenBtn');
+    if (fsBtn) fsBtn.textContent = qrImmersive ? '⛶ 退出整屏' : '⛶ 整屏展示';
+}
+
+async function enterQrImmersive() {
+    if (!qrCodes.length) return;
+    qrImmersive = true;
+    document.body.classList.add('qr-immersive');
+    syncPlayButtons();
+    const stage = document.getElementById('qrStage');
+    try {
+        const req = stage && (stage.requestFullscreen || stage.webkitRequestFullscreen);
+        if (req && !document.fullscreenElement) {
+            await Promise.resolve(req.call(stage)).catch(() => {});
+        }
+    } catch (_) {}
+}
+
+async function exitQrImmersive() {
+    qrImmersive = false;
+    document.body.classList.remove('qr-immersive');
+    syncPlayButtons();
+    try {
+        if (document.fullscreenElement && document.exitFullscreen) {
+            await document.exitFullscreen().catch(() => {});
+        }
+    } catch (_) {}
+}
+
+function toggleQrImmersive() {
+    if (qrImmersive) exitQrImmersive();
+    else enterQrImmersive();
+}
+
+document.getElementById('fullscreenBtn').addEventListener('click', toggleQrImmersive);
+document.getElementById('exitFullscreenBtn').addEventListener('click', exitQrImmersive);
+
+document.addEventListener('keydown', (e) => {
+    const tag = (e.target && e.target.tagName) || '';
+    const typing = tag === 'INPUT' || tag === 'TEXTAREA';
+    if (e.key === 'Escape' && qrImmersive) {
+        e.preventDefault();
+        exitQrImmersive();
+        return;
+    }
+    if (typing) return;
+    if ((e.key === 'n' || e.key === 'N' || e.key === ']') && gapList.length) {
+        e.preventDefault();
+        jumpNextGap();
+    }
+});
+
+document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement && qrImmersive) {
+        // 用户用系统 Esc 退出浏览器全屏时，同步退出沉浸样式
+        qrImmersive = false;
+        document.body.classList.remove('qr-immersive');
+        syncPlayButtons();
+    }
 });
 
 // ===== 自动播放 =====
@@ -460,6 +698,9 @@ const autoplayToggle = document.getElementById('autoplayToggle');
 const autoplayStatus = document.getElementById('autoplayStatus');
 
 playBtn.addEventListener('click', () => isPlaying ? stopAutoplay() : startAutoplay());
+document.getElementById('stagePlayBtn').addEventListener('click', () => {
+    isPlaying ? stopAutoplay() : startAutoplay();
+});
 autoplayToggle.addEventListener('change', () => autoplayToggle.checked ? startAutoplay() : stopAutoplay());
 
 function clearAutoplayTimer() {
@@ -486,8 +727,14 @@ function scheduleNextAutoplay() {
             showToast('播放完成');
             return;
         }
-        const nextIndex = next * gridCells();
+        const nextIndex = next >= dataPageCount()
+            ? chunks.length
+            : dataPairIndices(next).left;
         ensureQRCanvasReady(nextIndex);
+        if (next < dataPageCount()) {
+            const r = dataPairIndices(next).right;
+            if (r < chunks.length) ensureQRCanvasReady(r);
+        }
         showQRPage(next);
         scheduleNextAutoplay();
     }, CONFIG.AUTOPLAY_INTERVAL);
@@ -496,18 +743,18 @@ function scheduleNextAutoplay() {
 function startAutoplay() {
     if (!qrCodes.length) return;
     isPlaying = true;
-    playBtn.textContent = '⏸ 暂停';
     autoplayToggle.checked = true;
     autoplayStatus.textContent = '开启';
+    syncPlayButtons();
     schedulePrerenderAround(currentChunkIndex);
     scheduleNextAutoplay();
 }
 
 function stopAutoplay() {
     isPlaying = false;
-    playBtn.textContent = '▶ 播放';
     autoplayToggle.checked = false;
     autoplayStatus.textContent = '关闭';
+    syncPlayButtons();
     clearAutoplayTimer();
 }
 
@@ -603,21 +850,22 @@ resetBtn.addEventListener('click', () => {
     `;
 
     fileInfo.style.display = 'none';
+    exitQrImmersive();
     qrSection.classList.remove('show');
     downloadSection.classList.remove('show');
     generateBtn.disabled = true;
 
-    chunkSizeSlider.value = 2800;
-    chunkSizeValue.textContent = '2800 B';
-    CONFIG.CHUNK_SIZE = 2800;
+    chunkSizeSlider.value = DEFAULT_CHUNK_SIZE;
+    chunkSizeValue.textContent = DEFAULT_CHUNK_SIZE + ' B';
+    CONFIG.CHUNK_SIZE = DEFAULT_CHUNK_SIZE;
 
-    document.getElementById('qrSizeSlider').value = 900;
-    document.getElementById('qrSizeValue').textContent = '900 px';
-    CONFIG.QR_SIZE = 900;
+    document.getElementById('qrSizeSlider').value = DEFAULT_QR_SIZE;
+    document.getElementById('qrSizeValue').textContent = DEFAULT_QR_SIZE + ' px';
+    CONFIG.QR_SIZE = DEFAULT_QR_SIZE;
 
-    document.getElementById('intervalInput').value = 500;
-    document.getElementById('intervalAppliedValue').textContent = '500';
-    CONFIG.AUTOPLAY_INTERVAL = 500;
+    document.getElementById('intervalInput').value = DEFAULT_AUTOPLAY_INTERVAL;
+    document.getElementById('intervalAppliedValue').textContent = String(DEFAULT_AUTOPLAY_INTERVAL);
+    CONFIG.AUTOPLAY_INTERVAL = DEFAULT_AUTOPLAY_INTERVAL;
 
     hideRegenerateHints();
     document.getElementById('estimatedChunks').textContent = '-- 个';

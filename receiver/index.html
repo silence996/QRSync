@@ -199,15 +199,14 @@
             { formats: ['QRCode'] }
         ).then(() => {
             ZXingWASM._wasmReady = true;
-            console.log('[zxing-wasm] ✅ 已就绪');
         }).catch(e => {
             console.warn('[zxing-wasm] ⚠️ 初始化失败，将使用 jsQR 兜底:', e.message);
         });
     </script>
 
     <!-- 共享工具函数 -->
-    <script src="../shared/utils.js?v=20260726-abc2"></script>
+    <script src="../shared/utils.js?v=20260726-abc3"></script>
     <!-- 接收端逻辑（?v= 用于 file:// 强刷缓存） -->
-    <script src="receiver.js?v=20260726-abc2"></script>
+    <script src="receiver.js?v=20260726-abc3"></script>
 </body>
 </html>
