@@ -35,9 +35,13 @@ const SCAN_TUNING = {
     workerInflight: 2,
     /** 帧队列最大长度；满则背压丢弃新帧 */
     queueMax: 6,
-    /** 入队采样间隔 ms；目标 100ms 播放时建议 ≤50 */
-    sampleIntervalMs: 50,
-    /** 与上一入队帧指纹相同则跳过 */
+    /** 入队采样间隔 ms；100ms 播放建议 20–25，保证每码多次尝试 */
+    sampleIntervalMs: 25,
+    /**
+     * 指纹去重：
+     * true = 仅抑制「上一张 HIT 成功」的同指纹（MISS 可重试同画面）
+     * false = 完全不去重
+     */
     frameDedupe: true,
     /** 解码边长上限 */
     decodeMaxEdge: 560,
@@ -98,7 +102,7 @@ async function ensureDecodeWorkerScriptUrl() {
         console.log('[decode-worker] file:// 模式：加载 decode-worker-source.js → Blob Worker');
         const t0 = performance.now();
         if (!window.__QRSyncDecodeWorkerSource) {
-            await loadScriptOnce('decode-worker-source.js?v=20260726-blob2');
+            await loadScriptOnce('decode-worker-source.js?v=20260726-log3');
         }
         const source = window.__QRSyncDecodeWorkerSource;
         if (!source || typeof source !== 'string') {
@@ -517,6 +521,63 @@ function frameFingerprint(imgData) {
     return h;
 }
 
+/** 日志用：从解码文本提取分片编号 */
+function peekChunkLabel(text) {
+    if (!text) return '';
+    try {
+        if (text.startsWith('Q2')) {
+            const p = unpackQ2Packet(text.trim());
+            if (!p) return '';
+            if (p.type === 'fn') return 'fn';
+            return String(p.i + 1) + '/' + p.t;
+        }
+        const t = text.trim();
+        const chunk = JSON.parse(t);
+        if (chunk.t === 'fn') return 'fn';
+        if (typeof chunk.i === 'number') return String(chunk.i + 1) + '/' + (chunk.t || '?');
+    } catch (_) {}
+    return '';
+}
+
+/** 日志用：解析分片 index（0-based）与总数 */
+function peekChunkMeta(text) {
+    if (!text) return null;
+    try {
+        if (text.startsWith('Q2')) {
+            const p = unpackQ2Packet(text.trim());
+            if (!p) return null;
+            if (p.type === 'fn') return { kind: 'fn', i: -1, t: p.tc || 0 };
+            return { kind: 'data', i: p.i, t: p.t };
+        }
+        const chunk = JSON.parse(text.trim());
+        if (chunk.t === 'fn') return { kind: 'fn', i: -1, t: chunk.tc || 0 };
+        if (typeof chunk.i === 'number') return { kind: 'data', i: chunk.i, t: chunk.t || 0 };
+    } catch (_) {}
+    return null;
+}
+
+function formatChunkGaps(receivedSet, totalHint) {
+    if (!receivedSet.size && !(totalHint > 0)) return { got: '-', missing: '-', gotCount: 0, missCount: 0 };
+    const maxIdx = Math.max(
+        totalHint > 0 ? totalHint - 1 : 0,
+        ...(receivedSet.size ? receivedSet : [0])
+    );
+    const missing = [];
+    for (let i = 0; i <= maxIdx; i++) {
+        if (!receivedSet.has(i)) missing.push(i + 1);
+    }
+    const got = [...receivedSet].sort((a, b) => a - b).map(i => i + 1);
+    return {
+        got: got.join(',') || '-',
+        missing: missing.length ? missing.join(',') : '-',
+        gotCount: got.length,
+        missCount: missing.length
+    };
+}
+
+/** 停止扫描时输出本轮摘要 */
+let _scanSessionDump = null;
+
 function startScanLoop(video) {
     /**
      * 帧队列 + N Worker 并行消费不同历史帧。
@@ -528,12 +589,28 @@ function startScanLoop(video) {
     let inflight = 0;
     let frameIdSeq = 0;
     let lastSampleAt = 0;
+    /** 仅在 HIT 后抑制同指纹；MISS 允许同画面再入队重试 */
+    let lastHitFp = null;
     let lastEnqueuedFp = null;
+    let missStreak = 0;
+    let hitStreak = 0;
+    /** 本轮扫描解码到的分片（含重复 HIT） */
+    const seenChunkIdx = new Set();
+    /** 本轮真正新写入 receivedChunks 的分片 — 在 process 里也会写，这里用快照对比 */
+    let lastRecvCount = receivedChunks.size;
+    let totalHint = fileInfo?.totalChunks || 0;
+    const sessionStart = performance.now();
     const qStats = {
         enqueued: 0,
         dequeued: 0,
         dropFull: 0,
-        dropDedupe: 0
+        dropDedupe: 0,
+        hit: 0,
+        miss: 0,
+        newChunk: 0,
+        dupChunk: 0,
+        fpChange: 0,
+        fpRetry: 0
     };
     let lastStatsLogAt = 0;
 
@@ -546,6 +623,19 @@ function startScanLoop(video) {
         return want;
     }
 
+    function logRecvSnapshot(tag) {
+        const gaps = formatChunkGaps(receivedChunks.size ? new Set(receivedChunks.keys()) : seenChunkIdx, totalHint);
+        console.log(
+            `[scan] ${tag}` +
+            ` recv=${receivedChunks.size}` +
+            (totalHint ? `/${totalHint}` : '') +
+            ` got=[${gaps.got}]` +
+            ` missing=[${gaps.missing}]` +
+            ` missCount=${gaps.missCount}` +
+            ` elapsed=${(performance.now() - sessionStart).toFixed(0)}ms`
+        );
+    }
+
     function logScanStats(force) {
         const now = performance.now();
         if (!force && now - lastStatsLogAt < 1000) return;
@@ -553,6 +643,9 @@ function startScanLoop(video) {
         const avg = DECODE_TIMING.n ? DECODE_TIMING.sum / DECODE_TIMING.n : 0;
         const workers = currentInflightLimit();
         const path = decodeWorkerReady ? 'worker' : 'MAIN';
+        const hitRate = (qStats.hit + qStats.miss) > 0
+            ? ((100 * qStats.hit) / (qStats.hit + qStats.miss)).toFixed(0)
+            : '?';
         console.log(
             `[scan] q=${frameQueue.length}/${SCAN_TUNING.queueMax}` +
             ` inflight=${inflight}/${workers}` +
@@ -560,11 +653,19 @@ function startScanLoop(video) {
             ` pool=${decodeWorkers.length}` +
             ` enq=${qStats.enqueued} deq=${qStats.dequeued}` +
             ` dropFull=${qStats.dropFull} dropDedupe=${qStats.dropDedupe}` +
+            ` hit=${qStats.hit} miss=${qStats.miss} hitRate=${hitRate}%` +
+            ` new=${qStats.newChunk} dup=${qStats.dupChunk}` +
+            ` fpChange=${qStats.fpChange} fpRetry=${qStats.fpRetry}` +
+            ` missStreak=${missStreak}` +
             ` decodeAvg=${avg.toFixed(1)}ms` +
             ` suggest≥${avg ? Math.ceil(avg / workers) : '?'}ms` +
             ` target=${SCAN_TUNING.targetIntervalMs}ms` +
             ` sample=${SCAN_TUNING.sampleIntervalMs}ms`
         );
+        if (receivedChunks.size !== lastRecvCount || force) {
+            lastRecvCount = receivedChunks.size;
+            logRecvSnapshot('progress');
+        }
     }
 
     function pumpDecode() {
@@ -573,10 +674,7 @@ function startScanLoop(video) {
             const item = frameQueue.shift();
             qStats.dequeued++;
             inflight++;
-            console.log(
-                `[scan] dequeue #${item.id} → decode` +
-                ` q=${frameQueue.length} inflight=${inflight}/${limit}`
-            );
+            const tDecode0 = performance.now();
             decodeImageData(item.imgData, {
                 logMeta: {
                     frameId: item.id,
@@ -585,14 +683,59 @@ function startScanLoop(video) {
                 }
             })
                 .then((text) => {
+                    const ms = performance.now() - tDecode0;
                     if (text) {
+                        lastHitFp = item.fp;
+                        missStreak = 0;
+                        hitStreak++;
+                        qStats.hit++;
                         noteDecodeResult(true);
+                        const meta = peekChunkMeta(text);
+                        const label = peekChunkLabel(text);
+                        if (meta && meta.kind === 'data') {
+                            if (meta.t) totalHint = meta.t;
+                            const isNew = !seenChunkIdx.has(meta.i);
+                            if (isNew) {
+                                seenChunkIdx.add(meta.i);
+                                qStats.newChunk++;
+                            } else {
+                                qStats.dupChunk++;
+                            }
+                            console.log(
+                                `[scan] HIT chunk=${label}` +
+                                ` frame=#${item.id}` +
+                                ` ${ms.toFixed(1)}ms` +
+                                ` ${isNew ? 'NEW' : 'DUP'}` +
+                                ` hitStreak=${hitStreak}` +
+                                ` recv=${receivedChunks.size}` +
+                                (totalHint ? `/${totalHint}` : '')
+                            );
+                        } else if (label) {
+                            console.log(`[scan] HIT chunk=${label} frame=#${item.id} ${ms.toFixed(1)}ms`);
+                        }
                         handleScanResult(text);
                     } else {
+                        // MISS：不更新 lastHitFp，允许同指纹再入队重试
+                        hitStreak = 0;
+                        missStreak++;
+                        qStats.miss++;
                         noteDecodeResult(false);
+                        if (missStreak === 1 || missStreak % 5 === 0) {
+                            console.log(
+                                `[scan] MISS frame=#${item.id}` +
+                                ` ${ms.toFixed(1)}ms` +
+                                ` missStreak=${missStreak}` +
+                                ` fpRetry=${item.fp === lastHitFp ? 'n/a' : (item.fp === lastEnqueuedFp ? 'same-enq' : 'other')}`
+                            );
+                        }
                     }
                 })
-                .catch(() => noteDecodeResult(false))
+                .catch(() => {
+                    hitStreak = 0;
+                    missStreak++;
+                    qStats.miss++;
+                    noteDecodeResult(false);
+                })
                 .finally(() => {
                     inflight--;
                     pumpDecode();
@@ -619,22 +762,34 @@ function startScanLoop(video) {
             return;
         }
 
-        if (SCAN_TUNING.frameDedupe) {
-            const fp = frameFingerprint(imgData);
-            if (lastEnqueuedFp !== null && fp === lastEnqueuedFp) {
-                qStats.dropDedupe++;
-                return;
-            }
-            lastEnqueuedFp = fp;
+        const fp = frameFingerprint(imgData);
+        // 只跳过「已经 HIT 成功」的同一画面；换码或 MISS 后仍会再采
+        if (SCAN_TUNING.frameDedupe && lastHitFp !== null && fp === lastHitFp) {
+            qStats.dropDedupe++;
+            return;
         }
 
+        if (lastEnqueuedFp !== null && fp === lastEnqueuedFp) {
+            qStats.fpRetry++;
+        } else if (lastEnqueuedFp !== null) {
+            qStats.fpChange++;
+            console.log(
+                `[scan] fpChange enqueue next frame=#${frameIdSeq + 1}` +
+                ` (画面变化，可能已换码)`
+            );
+        }
+        lastEnqueuedFp = fp;
+
         const id = ++frameIdSeq;
-        frameQueue.push({ id, imgData, at: now });
+        frameQueue.push({ id, imgData, at: now, fp });
         qStats.enqueued++;
-        console.log(
-            `[scan] enqueue #${id} q=${frameQueue.length}/${queueMax}` +
-            ` inflight=${inflight}/${currentInflightLimit()}`
-        );
+        // 降噪：仅在队列积压或并行时打 enqueue
+        if (frameQueue.length > 1 || inflight > 0) {
+            console.log(
+                `[scan] enqueue #${id} q=${frameQueue.length}/${queueMax}` +
+                ` inflight=${inflight}/${currentInflightLimit()}`
+            );
+        }
         pumpDecode();
     }
 
@@ -663,6 +818,13 @@ function startScanLoop(video) {
         '[scan] 运行时可调: window.QRSyncScanTuning.' +
         '{workerInflight,queueMax,sampleIntervalMs,frameDedupe,decodeMaxEdge,targetIntervalMs}'
     );
+    console.log('[scan] 请关注日志: HIT chunk= / MISS / fpChange / progress missing= / SESSION');
+
+    _scanSessionDump = () => {
+        logScanStats(true);
+        logRecvSnapshot('SESSION');
+        console.log('[scan] SESSION stats', { ...qStats, totalHint, seenDecoded: seenChunkIdx.size });
+    };
 
     function tick(now) {
         if (!isScanning) return;
@@ -691,6 +853,10 @@ function stopScanLoop() {
     if (scanRafId !== null) {
         cancelAnimationFrame(scanRafId);
         scanRafId = null;
+    }
+    if (typeof _scanSessionDump === 'function') {
+        try { _scanSessionDump(); } catch (_) {}
+        _scanSessionDump = null;
     }
     if (DECODE_TIMING.n > 0) {
         const avg = DECODE_TIMING.sum / DECODE_TIMING.n;
