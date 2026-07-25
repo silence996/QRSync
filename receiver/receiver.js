@@ -31,11 +31,14 @@ let currentImageIndex = -1;
 
 /** 相机扫码可调参数（也可运行时改 window.QRSyncScanTuning） */
 const SCAN_TUNING = {
-    /** 同时解码的 Worker 数（并行消费队列） */
-    workerInflight: 2,
+    /**
+     * 同时解码路数。单张解码≈20–30ms 时，1 路即可跟上 100ms 播放；
+     * 2 路容易在 HIT 后仍有 in-flight DUP。难扫可改为 2。
+     */
+    workerInflight: 1,
     /** 帧队列最大长度；满则背压丢弃新帧 */
     queueMax: 6,
-    /** 入队采样间隔 ms；100ms 播放建议 20–25，保证每码多次尝试 */
+    /** 入队采样间隔 ms；100ms 播放建议 20–25 */
     sampleIntervalMs: 25,
     /**
      * 指纹去重：
@@ -44,10 +47,10 @@ const SCAN_TUNING = {
      */
     frameDedupe: true,
     /**
-     * HIT 后静默 ms：清空排队帧并暂停入队，避免同一张码 DUP 占满 Worker，
-     * 把算力留给下一张。建议约为 targetInterval 的 40%～60%。
+     * HIT 后静默 ms（含 sameText DUP 会续期）。
+     * 建议略小于播放间隔，覆盖「同一张码剩余展示时间」。
      */
-    quietAfterHitMs: 50,
+    quietAfterHitMs: 80,
     /** 解码边长上限 */
     decodeMaxEdge: 560,
     /** 目标播放间隔（仅用于日志对照） */
@@ -107,7 +110,7 @@ async function ensureDecodeWorkerScriptUrl() {
         console.log('[decode-worker] file:// 模式：加载 decode-worker-source.js → Blob Worker');
         const t0 = performance.now();
         if (!window.__QRSyncDecodeWorkerSource) {
-            await loadScriptOnce('decode-worker-source.js?v=20260726-quiet1');
+            await loadScriptOnce('decode-worker-source.js?v=20260726-quiet2');
         }
         const source = window.__QRSyncDecodeWorkerSource;
         if (!source || typeof source !== 'string') {
@@ -211,7 +214,7 @@ async function initDecodeWorker() {
         return false;
     }
 
-    const want = Math.max(2, SCAN_TUNING.workerInflight | 0);
+    const want = Math.max(1, SCAN_TUNING.workerInflight | 0);
     const count = Math.min(DECODE_WORKER_COUNT, want, copies.length);
     console.log(`[decode-worker] 正在初始化 x${count} (loader=file-blob-v2, protocol=${location.protocol}) ...`);
 
@@ -702,50 +705,7 @@ function startScanLoop(video) {
             })
                 .then((text) => {
                     const ms = performance.now() - tDecode0;
-                    if (text) {
-                        const quietMs = Math.max(0, SCAN_TUNING.quietAfterHitMs | 0);
-                        quietUntil = performance.now() + quietMs;
-                        // 丢掉仍在排队的旧帧，避免继续 DUP 同一张
-                        if (frameQueue.length) {
-                            qStats.dropQuiet = (qStats.dropQuiet || 0) + frameQueue.length;
-                            frameQueue.length = 0;
-                        }
-                        lastHitFp = item.fp;
-                        missStreak = 0;
-                        hitStreak++;
-                        qStats.hit++;
-                        noteDecodeResult(true);
-                        const meta = peekChunkMeta(text);
-                        const label = peekChunkLabel(text);
-                        const isDupText = text === lastHitText;
-                        lastHitText = text;
-                        if (meta && meta.kind === 'data') {
-                            if (meta.t) totalHint = meta.t;
-                            const isNew = !seenChunkIdx.has(meta.i);
-                            if (isNew) {
-                                seenChunkIdx.add(meta.i);
-                                qStats.newChunk++;
-                            } else {
-                                qStats.dupChunk++;
-                            }
-                            console.log(
-                                `[scan] HIT chunk=${label}` +
-                                ` frame=#${item.id}` +
-                                ` ${ms.toFixed(1)}ms` +
-                                ` ${isNew ? 'NEW' : 'DUP'}` +
-                                (isDupText ? ' sameText' : '') +
-                                ` quiet=${quietMs}ms` +
-                                ` hitStreak=${hitStreak}` +
-                                ` recv=${receivedChunks.size}` +
-                                (totalHint ? `/${totalHint}` : '')
-                            );
-                        } else if (label) {
-                            console.log(`[scan] HIT chunk=${label} frame=#${item.id} ${ms.toFixed(1)}ms quiet=${quietMs}ms`);
-                        }
-                        // 相同文本不必再走业务处理（去抖也会挡，这里省一点）
-                        if (!isDupText) handleScanResult(text);
-                    } else {
-                        // MISS：不更新 lastHitFp，允许同指纹再入队重试
+                    if (!text) {
                         hitStreak = 0;
                         missStreak++;
                         qStats.miss++;
@@ -758,7 +718,75 @@ function startScanLoop(video) {
                                 ` fpRetry=${item.fp === lastHitFp ? 'n/a' : (item.fp === lastEnqueuedFp ? 'same-enq' : 'other')}`
                             );
                         }
+                        return;
                     }
+
+                    const quietMs = Math.max(0, SCAN_TUNING.quietAfterHitMs | 0);
+                    const isDupText = !!lastHitText && text === lastHitText;
+
+                    // sameText / in-flight DUP：只续期静默，不占业务路径
+                    if (isDupText) {
+                        quietUntil = performance.now() + quietMs;
+                        lastHitFp = item.fp;
+                        if (frameQueue.length) {
+                            qStats.dropQuiet += frameQueue.length;
+                            frameQueue.length = 0;
+                        }
+                        hitStreak++;
+                        qStats.hit++;
+                        qStats.dupChunk++;
+                        noteDecodeResult(true);
+                        if (qStats.dupChunk <= 3 || qStats.dupChunk % 10 === 0) {
+                            console.log(
+                                `[scan] HIT DUP sameText frame=#${item.id}` +
+                                ` ${ms.toFixed(1)}ms quiet+=${quietMs}ms` +
+                                ` recv=${receivedChunks.size}` +
+                                (totalHint ? `/${totalHint}` : '')
+                            );
+                        }
+                        return;
+                    }
+
+                    // 新内容：清空队列 + 静默，把算力留给下一张
+                    quietUntil = performance.now() + quietMs;
+                    if (frameQueue.length) {
+                        qStats.dropQuiet += frameQueue.length;
+                        frameQueue.length = 0;
+                    }
+                    lastHitFp = item.fp;
+                    lastHitText = text;
+                    missStreak = 0;
+                    hitStreak = 1;
+                    qStats.hit++;
+                    noteDecodeResult(true);
+
+                    const meta = peekChunkMeta(text);
+                    const label = peekChunkLabel(text);
+                    if (meta && meta.kind === 'data') {
+                        if (meta.t) totalHint = meta.t;
+                        const isNew = !seenChunkIdx.has(meta.i);
+                        if (isNew) {
+                            seenChunkIdx.add(meta.i);
+                            qStats.newChunk++;
+                        } else {
+                            qStats.dupChunk++;
+                        }
+                        console.log(
+                            `[scan] HIT chunk=${label}` +
+                            ` frame=#${item.id}` +
+                            ` ${ms.toFixed(1)}ms` +
+                            ` ${isNew ? 'NEW' : 'DUP-idx'}` +
+                            ` quiet=${quietMs}ms` +
+                            ` recv=${receivedChunks.size}` +
+                            (totalHint ? `/${totalHint}` : '')
+                        );
+                    } else if (label) {
+                        console.log(
+                            `[scan] HIT chunk=${label} frame=#${item.id}` +
+                            ` ${ms.toFixed(1)}ms quiet=${quietMs}ms`
+                        );
+                    }
+                    handleScanResult(text);
                 })
                 .catch(() => {
                     hitStreak = 0;
