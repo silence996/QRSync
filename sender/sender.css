@@ -129,6 +129,13 @@
 
 .interval-applied-hint.show { display: block; }
 
+.interval-hint {
+    margin: 8px 0 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    opacity: 0.85;
+}
+
 /* ===== Progress Section ===== */
 .progress-section {
     margin-top: 24px;

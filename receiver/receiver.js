@@ -47,14 +47,19 @@ const SCAN_TUNING = {
      */
     frameDedupe: true,
     /**
-     * HIT 后静默 ms（含 sameText DUP 会续期）。
-     * 建议略小于播放间隔，覆盖「同一张码剩余展示时间」。
+     * NEW HIT 后静默 ms（仅设一次；sameText DUP 不续期，避免滚雪球错过换码）。
+     * 建议约为 targetInterval 的 40%～50%。
      */
-    quietAfterHitMs: 80,
+    quietAfterHitMs: 100,
+    /**
+     * 某文本首次 NEW HIT 后的同码锁定 ms：期间一律不入队（sameText 不延长）。
+     * 用于挡住指纹抖动导致的同码 DUP，约为 targetInterval 的 80%。
+     */
+    sameTextHoldMs: 200,
     /** 解码边长上限 */
     decodeMaxEdge: 560,
-    /** 目标播放间隔（仅用于日志对照） */
-    targetIntervalMs: 100
+    /** 目标播放间隔（与发送端默认一致，仅用于日志对照） */
+    targetIntervalMs: 250
 };
 window.QRSyncScanTuning = SCAN_TUNING;
 
@@ -110,7 +115,7 @@ async function ensureDecodeWorkerScriptUrl() {
         console.log('[decode-worker] file:// 模式：加载 decode-worker-source.js → Blob Worker');
         const t0 = performance.now();
         if (!window.__QRSyncDecodeWorkerSource) {
-            await loadScriptOnce('decode-worker-source.js?v=20260726-quiet2');
+            await loadScriptOnce('decode-worker-source.js?v=20260726-interval250');
         }
         const source = window.__QRSyncDecodeWorkerSource;
         if (!source || typeof source !== 'string') {
@@ -517,14 +522,15 @@ function captureFrame(video) {
     return cropCtx.getImageData(0, 0, dstSize, dstSize);
 }
 
-/** 廉价帧指纹，用于入队去重 */
+/** 廉价帧指纹，用于入队去重（粗量化，抑制相机噪声假换码） */
 function frameFingerprint(imgData) {
     const d = imgData.data;
     const len = d.length;
-    const step = Math.max(64, ((len / 128) | 0) & ~3);
+    const step = Math.max(256, ((len / 48) | 0) & ~3);
     let h = (imgData.width * 73856093) ^ (imgData.height * 19349663);
     for (let i = 0; i < len; i += step) {
-        h = (Math.imul(h, 31) + d[i]) | 0;
+        // >>3：约 32 级亮度，忽略低位噪声
+        h = (Math.imul(h, 31) + (d[i] >> 3)) | 0;
     }
     return h;
 }
@@ -609,6 +615,8 @@ function startScanLoop(video) {
     let lastHitText = null;
     let lastEnqueuedFp = null;
     let quietUntil = 0;
+    /** 某文本首次 NEW 后的绝对锁定截止（sameText 不延长） */
+    let sameTextHoldUntil = 0;
     let missStreak = 0;
     let hitStreak = 0;
     /** 本轮扫描解码到的分片（含重复 HIT） */
@@ -724,9 +732,8 @@ function startScanLoop(video) {
                     const quietMs = Math.max(0, SCAN_TUNING.quietAfterHitMs | 0);
                     const isDupText = !!lastHitText && text === lastHitText;
 
-                    // sameText / in-flight DUP：只续期静默，不占业务路径
+                    // sameText / in-flight DUP：不续期 quiet/hold（续期会滚雪球错过换码）
                     if (isDupText) {
-                        quietUntil = performance.now() + quietMs;
                         lastHitFp = item.fp;
                         if (frameQueue.length) {
                             qStats.dropQuiet += frameQueue.length;
@@ -739,7 +746,7 @@ function startScanLoop(video) {
                         if (qStats.dupChunk <= 3 || qStats.dupChunk % 10 === 0) {
                             console.log(
                                 `[scan] HIT DUP sameText frame=#${item.id}` +
-                                ` ${ms.toFixed(1)}ms quiet+=${quietMs}ms` +
+                                ` ${ms.toFixed(1)}ms (no hold extend)` +
                                 ` recv=${receivedChunks.size}` +
                                 (totalHint ? `/${totalHint}` : '')
                             );
@@ -747,8 +754,11 @@ function startScanLoop(video) {
                         return;
                     }
 
-                    // 新内容：清空队列 + 静默，把算力留给下一张
-                    quietUntil = performance.now() + quietMs;
+                    // 新内容：清空队列 + 短静默 + 同码时间窗锁定
+                    const holdMs = Math.max(0, SCAN_TUNING.sameTextHoldMs | 0);
+                    const nowHit = performance.now();
+                    quietUntil = nowHit + quietMs;
+                    sameTextHoldUntil = nowHit + holdMs;
                     if (frameQueue.length) {
                         qStats.dropQuiet += frameQueue.length;
                         frameQueue.length = 0;
@@ -776,14 +786,14 @@ function startScanLoop(video) {
                             ` frame=#${item.id}` +
                             ` ${ms.toFixed(1)}ms` +
                             ` ${isNew ? 'NEW' : 'DUP-idx'}` +
-                            ` quiet=${quietMs}ms` +
+                            ` quiet=${quietMs}ms hold=${holdMs}ms` +
                             ` recv=${receivedChunks.size}` +
                             (totalHint ? `/${totalHint}` : '')
                         );
                     } else if (label) {
                         console.log(
                             `[scan] HIT chunk=${label} frame=#${item.id}` +
-                            ` ${ms.toFixed(1)}ms quiet=${quietMs}ms`
+                            ` ${ms.toFixed(1)}ms quiet=${quietMs}ms hold=${holdMs}ms`
                         );
                     }
                     handleScanResult(text);
@@ -809,8 +819,8 @@ function startScanLoop(video) {
         }
         lastSampleAt = now;
 
-        // HIT 后静默：给发送端换码时间，避免 DUP 占满解码
-        if (now < quietUntil) {
+        // HIT 后静默 / 同码锁定：给发送端换码时间，避免 DUP 占满解码
+        if (now < quietUntil || now < sameTextHoldUntil) {
             qStats.dropQuiet = (qStats.dropQuiet || 0) + 1;
             return;
         }
@@ -865,6 +875,7 @@ function startScanLoop(video) {
             sampleIntervalMs: SCAN_TUNING.sampleIntervalMs,
             frameDedupe: SCAN_TUNING.frameDedupe,
             quietAfterHitMs: SCAN_TUNING.quietAfterHitMs,
+            sameTextHoldMs: SCAN_TUNING.sameTextHoldMs,
             decodeMaxEdge: SCAN_TUNING.decodeMaxEdge,
             targetIntervalMs: SCAN_TUNING.targetIntervalMs,
             poolSize: decodeWorkers.length,
@@ -881,7 +892,7 @@ function startScanLoop(video) {
     }
     console.log(
         '[scan] 运行时可调: window.QRSyncScanTuning.' +
-        '{workerInflight,queueMax,sampleIntervalMs,frameDedupe,quietAfterHitMs,decodeMaxEdge,targetIntervalMs}'
+        '{workerInflight,queueMax,sampleIntervalMs,frameDedupe,quietAfterHitMs,sameTextHoldMs,decodeMaxEdge,targetIntervalMs}'
     );
     console.log('[scan] 请关注日志: HIT chunk= / MISS / fpChange / progress gapsBeforeMax= / SESSION');
 
