@@ -47,7 +47,7 @@ const SCAN_TUNING = {
      */
     frameDedupe: true,
     /** 解码边长上限 */
-    decodeMaxEdge: 560
+    decodeMaxEdge: 800
 };
 window.QRSyncScanTuning = SCAN_TUNING;
 
@@ -103,7 +103,7 @@ async function ensureDecodeWorkerScriptUrl() {
         console.log('[decode-worker] file:// 模式：加载 decode-worker-source.js → Blob Worker');
         const t0 = performance.now();
         if (!window.__QRSyncDecodeWorkerSource) {
-            await loadScriptOnce('decode-worker-source.js?v=20260726-decouple1');
+            await loadScriptOnce('decode-worker-source.js?v=20260726-abc2');
         }
         const source = window.__QRSyncDecodeWorkerSource;
         if (!source || typeof source !== 'string') {
@@ -168,7 +168,12 @@ function createDecodeWorker(wasmBinary) {
                         if (!pending) return;
                         pendingDecodes.delete(msg.id);
                         idleWorkers.push(worker);
-                        pending.resolve(msg.text || null);
+                        pending.resolve({
+                            text: msg.text || null,
+                            texts: Array.isArray(msg.texts) && msg.texts.length
+                                ? msg.texts
+                                : (msg.text ? [msg.text] : [])
+                        });
                     }
                 };
                 worker.onerror = (err) => {
@@ -248,7 +253,7 @@ function decodeOnWorker(imgData, options) {
             } catch (_) {
                 pendingDecodes.delete(id);
                 idleWorkers.push(worker);
-                resolve(null);
+                resolve({ text: null, texts: [] });
             }
         };
 
@@ -267,7 +272,7 @@ function decodeOnWorker(imgData, options) {
                 return;
             }
             if (performance.now() - start > 2000) {
-                resolve(null);
+                resolve({ text: null, texts: [] });
                 return;
             }
             setTimeout(wait, 0);
@@ -334,7 +339,7 @@ function prepareImageDataForDecode(imgData) {
 }
 
 function getZXingOptions(forceHard) {
-    // 连播场景优先快路径：慢选项会拖长单帧占用，反而漏扫
+    // 连播场景优先快路径；横向双码最多 2；BINARY 避免把载荷当 UTF-8
     if (forceHard) {
         return {
             formats: ['QRCode'],
@@ -342,7 +347,8 @@ function getZXingOptions(forceHard) {
             tryRotate: true,
             tryInvert: true,
             tryDownscale: false,
-            maxNumberOfSymbols: 1,
+            maxNumberOfSymbols: 2,
+            characterSet: 'BINARY',
             allowJsQR: true
         };
     }
@@ -352,7 +358,8 @@ function getZXingOptions(forceHard) {
         tryRotate: false,
         tryInvert: false,
         tryDownscale: false,
-        maxNumberOfSymbols: 1,
+        maxNumberOfSymbols: 2,
+        characterSet: 'BINARY',
         allowJsQR: false
     };
 }
@@ -361,6 +368,33 @@ function noteDecodeResult(ok) {
     // 相机连播不再自动切 hard mode（rotate/invert/jsQR 太慢，100ms 下会雪崩漏扫）
     if (ok) zxingMissStreak = 0;
     else zxingMissStreak++;
+}
+
+/** ZXing ReadResult → Latin-1 字符串（优先 bytes，避免 UTF-8 损坏二进制包） */
+function zxingResultToLatin1(result) {
+    if (!result) return null;
+    const bytes = result.bytes;
+    if (bytes && bytes.length) {
+        const CHUNK = 0x8000;
+        let s = '';
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+            const end = Math.min(i + CHUNK, bytes.length);
+            const slice = bytes.subarray ? bytes.subarray(i, end) : bytes.slice(i, end);
+            s += String.fromCharCode.apply(null, slice);
+        }
+        return s;
+    }
+    return result.text || null;
+}
+
+function zxingResultsToTexts(results) {
+    if (!results || !results.length) return [];
+    const out = [];
+    for (let i = 0; i < results.length; i++) {
+        const t = zxingResultToLatin1(results[i]);
+        if (t) out.push(t);
+    }
+    return out;
 }
 
 // ===== 统一解码函数 =====
@@ -419,11 +453,11 @@ async function decodeImageData(imgData, { forceHard = false, logMeta = null } = 
     const t0 = performance.now();
     imgData = prepareImageDataForDecode(imgData);
     const options = getZXingOptions(forceHard);
-    let text = null;
+    let texts = [];
     let path = 'none';
 
-    const emitLog = () => {
-        logDecodeTiming(performance.now() - t0, !!text, {
+    const emitLog = (ok) => {
+        logDecodeTiming(performance.now() - t0, ok, {
             w: imgData.width,
             h: imgData.height,
             forceHard,
@@ -434,10 +468,11 @@ async function decodeImageData(imgData, { forceHard = false, logMeta = null } = 
 
     if (decodeWorkerReady) {
         try {
-            text = await decodeOnWorker(imgData, options);
+            const res = await decodeOnWorker(imgData, options);
+            texts = (res && res.texts) || [];
             path = 'worker';
-            emitLog();
-            return text;
+            emitLog(texts.length > 0);
+            return texts;
         } catch (_) {
             // Worker 异常时回退主线程
         }
@@ -446,18 +481,18 @@ async function decodeImageData(imgData, { forceHard = false, logMeta = null } = 
     if (typeof ZXingWASM !== 'undefined' && ZXingWASM._wasmReady) {
         try {
             const results = await ZXingWASM.readBarcodesFromImageData(imgData, options);
-            if (results.length > 0) text = results[0].text;
+            texts = zxingResultsToTexts(results);
             path = 'main-zxing';
         } catch (_) {}
     }
-    if (!text) {
+    if (!texts.length) {
         const r = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: 'dontInvert' });
-        text = r ? r.data : null;
-        path = text ? 'jsQR' : (path === 'none' ? 'jsQR' : path);
+        if (r && r.data) texts = [r.data];
+        path = texts.length ? 'jsQR' : (path === 'none' ? 'jsQR' : path);
     }
 
-    emitLog();
-    return text;
+    emitLog(texts.length > 0);
+    return texts;
 }
 
 // ===== 相机模式 =====
@@ -522,18 +557,16 @@ function frameFingerprint(imgData) {
     return h;
 }
 
-/** 日志用：从解码文本提取分片编号 */
+/** 日志用：从解码文本提取分片编号（Q3/Q2/JSON） */
 function peekChunkLabel(text) {
     if (!text) return '';
     try {
-        if (text.startsWith('Q2')) {
-            const p = unpackQ2Packet(text.trim());
-            if (!p) return '';
+        const p = unpackQRPacket(text);
+        if (p) {
             if (p.type === 'fn') return 'fn';
             return String(p.i + 1) + '/' + p.t;
         }
-        const t = text.trim();
-        const chunk = JSON.parse(t);
+        const chunk = JSON.parse(text.trim());
         if (chunk.t === 'fn') return 'fn';
         if (typeof chunk.i === 'number') return String(chunk.i + 1) + '/' + (chunk.t || '?');
     } catch (_) {}
@@ -544,9 +577,8 @@ function peekChunkLabel(text) {
 function peekChunkMeta(text) {
     if (!text) return null;
     try {
-        if (text.startsWith('Q2')) {
-            const p = unpackQ2Packet(text.trim());
-            if (!p) return null;
+        const p = unpackQRPacket(text);
+        if (p) {
             if (p.type === 'fn') return { kind: 'fn', i: -1, t: p.tc || 0 };
             return { kind: 'data', i: p.i, t: p.t };
         }
@@ -599,7 +631,7 @@ function startScanLoop(video) {
     let lastSampleAt = 0;
     /** 仅在 HIT 后抑制同指纹；MISS 允许同画面再入队重试 */
     let lastHitFp = null;
-    let lastHitText = null;
+    let lastHitFrameKey = null;
     let lastEnqueuedFp = null;
     let missStreak = 0;
     let hitStreak = 0;
@@ -694,9 +726,9 @@ function startScanLoop(video) {
                     inflight
                 }
             })
-                .then((text) => {
+                .then((texts) => {
                     const ms = performance.now() - tDecode0;
-                    if (!text) {
+                    if (!texts || !texts.length) {
                         hitStreak = 0;
                         missStreak++;
                         qStats.miss++;
@@ -712,10 +744,18 @@ function startScanLoop(video) {
                         return;
                     }
 
-                    const isDupText = !!lastHitText && text === lastHitText;
+                    const uniq = [];
+                    const seenTxt = new Set();
+                    for (let i = 0; i < texts.length; i++) {
+                        const t = texts[i];
+                        if (!t || seenTxt.has(t)) continue;
+                        seenTxt.add(t);
+                        uniq.push(t);
+                    }
+                    const frameKey = uniq.slice().sort().join('\0');
+                    const isDupFrame = !!lastHitFrameKey && frameKey === lastHitFrameKey;
 
-                    // sameText：内容驱动抑制，不依赖发送间隔
-                    if (isDupText) {
+                    if (isDupFrame) {
                         lastHitFp = item.fp;
                         if (frameQueue.length) {
                             qStats.dropQuiet += frameQueue.length;
@@ -723,11 +763,12 @@ function startScanLoop(video) {
                         }
                         hitStreak++;
                         qStats.hit++;
-                        qStats.dupChunk++;
+                        qStats.dupChunk += uniq.length;
                         noteDecodeResult(true);
                         if (qStats.dupChunk <= 3 || qStats.dupChunk % 10 === 0) {
                             console.log(
-                                `[scan] HIT DUP sameText frame=#${item.id}` +
+                                `[scan] HIT DUP samePage frame=#${item.id}` +
+                                ` n=${uniq.length}` +
                                 ` ${ms.toFixed(1)}ms` +
                                 ` recv=${receivedChunks.size}` +
                                 (totalHint ? `/${totalHint}` : '')
@@ -736,44 +777,57 @@ function startScanLoop(video) {
                         return;
                     }
 
-                    // 新内容：清队列，把算力留给后续帧（无时间窗静默）
-                    if (frameQueue.length) {
-                        qStats.dropQuiet += frameQueue.length;
-                        frameQueue.length = 0;
+                    let anyNew = false;
+                    for (let i = 0; i < uniq.length; i++) {
+                        const text = uniq[i];
+                        const meta = peekChunkMeta(text);
+                        const label = peekChunkLabel(text);
+                        if (meta && meta.kind === 'data') {
+                            if (meta.t) totalHint = meta.t;
+                            const isNew = !seenChunkIdx.has(meta.i);
+                            if (isNew) {
+                                seenChunkIdx.add(meta.i);
+                                qStats.newChunk++;
+                                anyNew = true;
+                            } else {
+                                qStats.dupChunk++;
+                            }
+                            console.log(
+                                `[scan] HIT chunk=${label}` +
+                                ` frame=#${item.id}` +
+                                ` n=${uniq.length}` +
+                                ` ${ms.toFixed(1)}ms` +
+                                ` ${isNew ? 'NEW' : 'DUP-idx'}` +
+                                ` recv=${receivedChunks.size}` +
+                                (totalHint ? `/${totalHint}` : '')
+                            );
+                        } else if (label) {
+                            if (meta && meta.kind === 'fn') anyNew = true;
+                            console.log(
+                                `[scan] HIT chunk=${label} frame=#${item.id}` +
+                                ` n=${uniq.length}` +
+                                ` ${ms.toFixed(1)}ms`
+                            );
+                        }
+                        handleScanResult(text);
                     }
-                    lastHitFp = item.fp;
-                    lastHitText = text;
+
                     missStreak = 0;
                     hitStreak = 1;
                     qStats.hit++;
                     noteDecodeResult(true);
+                    lastHitFrameKey = frameKey;
 
-                    const meta = peekChunkMeta(text);
-                    const label = peekChunkLabel(text);
-                    if (meta && meta.kind === 'data') {
-                        if (meta.t) totalHint = meta.t;
-                        const isNew = !seenChunkIdx.has(meta.i);
-                        if (isNew) {
-                            seenChunkIdx.add(meta.i);
-                            qStats.newChunk++;
-                        } else {
-                            qStats.dupChunk++;
+                    // 双码页：收齐 2 或本帧无新分片时抑制同画面，避免漏码后无法重扫
+                    if (uniq.length >= 2 || !anyNew) {
+                        lastHitFp = item.fp;
+                        if (frameQueue.length) {
+                            qStats.dropQuiet += frameQueue.length;
+                            frameQueue.length = 0;
                         }
-                        console.log(
-                            `[scan] HIT chunk=${label}` +
-                            ` frame=#${item.id}` +
-                            ` ${ms.toFixed(1)}ms` +
-                            ` ${isNew ? 'NEW' : 'DUP-idx'}` +
-                            ` recv=${receivedChunks.size}` +
-                            (totalHint ? `/${totalHint}` : '')
-                        );
-                    } else if (label) {
-                        console.log(
-                            `[scan] HIT chunk=${label} frame=#${item.id}` +
-                            ` ${ms.toFixed(1)}ms`
-                        );
+                    } else {
+                        lastHitFp = null;
                     }
-                    handleScanResult(text);
                 })
                 .catch(() => {
                     hitStreak = 0;
@@ -1071,13 +1125,9 @@ function handleScanResult(decodedText) {
 
 async function processChunkData(data) {
     try {
-        let trimmed = data.trim();
-
-        // ===== Q2 紧凑协议 =====
-        if (trimmed.startsWith('Q2')) {
-            const packet = unpackQ2Packet(trimmed);
-            if (!packet) throw new Error('Q2 解析失败');
-
+        // ===== Q3 二进制 / Q2 文本协议 =====
+        const packet = typeof unpackQRPacket === 'function' ? unpackQRPacket(data) : null;
+        if (packet) {
             if (packet.type === 'fn') {
                 if (currentFileFingerprint && packet.f !== currentFileFingerprint) {
                     showFloatingMessage('⚠️ 文件指纹不匹配', true);
@@ -1135,6 +1185,8 @@ async function processChunkData(data) {
             }
             return;
         }
+
+        let trimmed = data.trim();
 
         // ===== 旧版 JSON 协议（兼容） =====
         if (!trimmed.startsWith('{') && trimmed.includes('{'))
@@ -1296,9 +1348,11 @@ async function scanCurrent() {
         const ctx = canvas.getContext('2d');
         const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-        const text = await decodeImageData(imgData, { forceHard: true });
-        if (text) {
-            processChunkData(text);
+        const texts = await decodeImageData(imgData, { forceHard: true });
+        if (texts && texts.length) {
+            for (let i = 0; i < texts.length; i++) {
+                processChunkData(texts[i]);
+            }
             item.status = 'completed';
             setTimeout(() => {
                 if (currentImageIndex < imageQueue.length - 1) selectImage(currentImageIndex + 1);

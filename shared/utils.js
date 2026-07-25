@@ -78,10 +78,12 @@ function z85Decode(str) {
     return out;
 }
 
-/** Q2 协议前缀；二维码文本 = Q2 + z85(二进制包) */
+/** Q2：文本 = "Q2" + z85(二进制包)（旧版兼容） */
 const Q2_PREFIX = 'Q2';
 const Q2_TYPE_DATA = 0;
 const Q2_TYPE_FILENAME = 1;
+/** Version 40 / L 最大字节数 */
+const QR_MAX_BYTES_L40 = 2953;
 
 function normalizeFingerprint(fp) {
     const s = String(fp || '');
@@ -89,7 +91,23 @@ function normalizeFingerprint(fp) {
     return (s + '00000').slice(0, 5);
 }
 
-function packQ2DataChunk(index, total, fingerprint, payload) {
+/** Uint8Array → Latin-1 字符串（QR byte 模式；需配合已 patch 的 qrcode 库） */
+function bytesToLatin1String(u8) {
+    const CHUNK = 0x8000;
+    let s = '';
+    for (let i = 0; i < u8.length; i += CHUNK) {
+        s += String.fromCharCode.apply(null, u8.subarray(i, Math.min(i + CHUNK, u8.length)));
+    }
+    return s;
+}
+
+function latin1StringToBytes(s) {
+    const u8 = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) u8[i] = s.charCodeAt(i) & 0xff;
+    return u8;
+}
+
+function buildQ2DataBytes(index, total, fingerprint, payload) {
     const fp = normalizeFingerprint(fingerprint);
     const buf = new Uint8Array(20 + payload.length);
     const dv = new DataView(buf.buffer);
@@ -100,10 +118,10 @@ function packQ2DataChunk(index, total, fingerprint, payload) {
     dv.setUint32(14, crc32Bytes(payload));
     dv.setUint16(18, payload.length);
     buf.set(payload, 20);
-    return Q2_PREFIX + z85Encode(buf);
+    return buf;
 }
 
-function packQ2FilenameChunk(fingerprint, filename, size, totalChunks, timestamp) {
+function buildQ2FilenameBytes(fingerprint, filename, size, totalChunks, timestamp) {
     const fp = normalizeFingerprint(fingerprint);
     const nameBytes = new TextEncoder().encode(filename);
     const bodyLen = 20 + nameBytes.length;
@@ -117,13 +135,32 @@ function packQ2FilenameChunk(fingerprint, filename, size, totalChunks, timestamp
     dv.setUint16(18, nameBytes.length);
     packet.set(nameBytes, 20);
     dv.setUint32(bodyLen, crc32Bytes(packet.subarray(0, bodyLen)));
-    return Q2_PREFIX + z85Encode(packet);
+    return packet;
 }
 
-function unpackQ2Packet(text) {
-    if (!text || !text.startsWith(Q2_PREFIX)) return null;
-    const raw = z85Decode(text.slice(Q2_PREFIX.length));
-    if (raw.length < 1) throw new Error('Q2 包过短');
+/** Q3：二进制包直接进 QR（Latin-1 往返） */
+function packQ3DataChunk(index, total, fingerprint, payload) {
+    return bytesToLatin1String(buildQ2DataBytes(index, total, fingerprint, payload));
+}
+
+function packQ3FilenameChunk(fingerprint, filename, size, totalChunks, timestamp) {
+    return bytesToLatin1String(
+        buildQ2FilenameBytes(fingerprint, filename, size, totalChunks, timestamp)
+    );
+}
+
+function packQ2DataChunk(index, total, fingerprint, payload) {
+    return Q2_PREFIX + z85Encode(buildQ2DataBytes(index, total, fingerprint, payload));
+}
+
+function packQ2FilenameChunk(fingerprint, filename, size, totalChunks, timestamp) {
+    return Q2_PREFIX + z85Encode(
+        buildQ2FilenameBytes(fingerprint, filename, size, totalChunks, timestamp)
+    );
+}
+
+function unpackQ2Binary(raw) {
+    if (!raw || raw.length < 1) throw new Error('Q2 包过短');
     const type = raw[0];
     const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
 
@@ -159,6 +196,22 @@ function unpackQ2Packet(text) {
     }
 
     throw new Error('未知 Q2 类型');
+}
+
+function unpackQ2Packet(text) {
+    if (!text || !text.startsWith(Q2_PREFIX)) return null;
+    return unpackQ2Binary(z85Decode(text.slice(Q2_PREFIX.length)));
+}
+
+/** 自动识别 Q2 文本 / Q3 二进制 */
+function unpackQRPacket(text) {
+    if (!text) return null;
+    if (text.startsWith(Q2_PREFIX)) return unpackQ2Packet(text.trim());
+    try {
+        return unpackQ2Binary(latin1StringToBytes(text));
+    } catch (_) {
+        return null;
+    }
 }
 
 // 分块 base64 编码，避免大数组展开导致调用栈溢出

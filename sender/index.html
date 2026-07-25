@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>QRSync - 发送端</title>
     <link rel="stylesheet" href="../shared/theme.css">
-    <link rel="stylesheet" href="sender.css">
+    <link rel="stylesheet" href="sender.css?v=20260726-abc2">
 </head>
 <body>
     <nav>
@@ -65,20 +65,20 @@
             <div class="slider-container">
                 <div class="slider-header">
                     <span class="slider-label">分片大小</span>
-                    <span class="slider-value" id="chunkSizeValue">2200 B</span>
+                    <span class="slider-value" id="chunkSizeValue">2800 B</span>
                 </div>
-                <input type="range" id="chunkSizeSlider" min="200" max="2200" value="2200" step="50">
-                <div class="slider-marks"><span>200B</span><span>2200B</span></div>
+                <input type="range" id="chunkSizeSlider" min="200" max="2900" value="2800" step="50">
+                <div class="slider-marks"><span>200B</span><span>2900B</span></div>
                 <div class="slider-hint show" id="chunkSizeHint" style="display:none">⚠️ 更改此设置需要重新生成二维码</div>
             </div>
 
             <div class="slider-container">
                 <div class="slider-header">
                     <span class="slider-label">二维码尺寸</span>
-                    <span class="slider-value" id="qrSizeValue">2000 px</span>
+                    <span class="slider-value" id="qrSizeValue">900 px</span>
                 </div>
-                <input type="range" id="qrSizeSlider" min="600" max="2000" value="2000" step="50">
-                <div class="slider-marks"><span>600px</span><span>2000px</span></div>
+                <input type="range" id="qrSizeSlider" min="400" max="1600" value="900" step="50">
+                <div class="slider-marks"><span>400px</span><span>1600px</span></div>
                 <div class="slider-hint" id="qrSizeHint">⚠️ 更改此设置需要重新点击"生成二维码"</div>
             </div>
 
@@ -87,14 +87,14 @@
                     <span class="interval-label">播放间隔</span>
                 </div>
                 <div class="interval-input-row">
-                    <input type="number" class="interval-input" id="intervalInput" min="100" max="60000" value="250">
+                    <input type="number" class="interval-input" id="intervalInput" min="100" max="60000" value="500">
                     <span class="interval-unit">毫秒</span>
                     <button class="interval-confirm-btn" id="intervalConfirmBtn">确定</button>
                 </div>
                 <div class="interval-applied-hint" id="intervalAppliedHint">
-                    ✅ 已设置为 <span id="intervalAppliedValue">250</span> ms
+                    ✅ 已设置为 <span id="intervalAppliedValue">500</span> ms
                 </div>
-                <p class="interval-hint">推荐 200–250ms（100ms 易漏片）</p>
+                <p class="interval-hint">推荐 ≥500ms（横向双码每页 2 码；间隔指翻页间隔）</p>
             </div>
 
             <div class="progress-section">
@@ -136,9 +136,9 @@
             </div>
 
             <div class="qr-controls">
-                <button class="qr-nav-btn" id="prevBtn">← 上一个</button>
+                <button class="qr-nav-btn" id="prevBtn">← 上一页</button>
                 <button class="qr-nav-btn" id="playBtn">▶ 播放</button>
-                <button class="qr-nav-btn" id="nextBtn">下一个 →</button>
+                <button class="qr-nav-btn" id="nextBtn">下一页 →</button>
             </div>
 
             <div class="qr-display">
@@ -179,8 +179,8 @@
     <script src="../js/qrcode.min.js"></script>
     <script src="../js/jszip.min.js"></script>
     <!-- 共享工具函数 -->
-    <script src="../shared/utils.js"></script>
+    <script src="../shared/utils.js?v=20260726-abc2"></script>
     <!-- 发送端逻辑 -->
-    <script src="sender.js"></script>
+    <script src="sender.js?v=20260726-abc2"></script>
 </body>
 </html>

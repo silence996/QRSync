@@ -202,6 +202,52 @@
 
 #qrcode img, #qrcode canvas { max-width: 100%; height: auto; display: block; }
 
+.qr-grid-inner {
+    display: grid;
+    gap: 12px;
+    width: 100%;
+    max-width: min(96vw, 1100px);
+    margin: 0 auto;
+    align-items: center;
+}
+
+/* 横向双码：占满可用宽度，避免竖向挤出屏幕 */
+.qr-grid-inner.qr-grid-row {
+    gap: 16px;
+    max-height: min(70vh, 520px);
+}
+
+.qr-grid-inner.qr-grid-row .qr-grid-cell {
+    max-height: inherit;
+}
+
+.qr-grid-inner.qr-grid-row .qr-grid-cell canvas {
+    max-height: min(70vh, 520px);
+    width: auto;
+    max-width: 100%;
+    object-fit: contain;
+}
+
+.qr-grid-cell {
+    background: #fff;
+    padding: 6px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.qr-grid-cell canvas {
+    width: 100%;
+    height: auto;
+    display: block;
+}
+
+.qr-grid-cell.empty {
+    background: rgba(255, 255, 255, 0.06);
+    min-height: 80px;
+}
+
 .qr-info { text-align: center; }
 
 .qr-counter { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
