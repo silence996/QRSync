@@ -24,6 +24,143 @@ function calculateCRC32(str) {
     return ((crc ^ 0xFFFFFFFF) >>> 0).toString(36).padStart(5, '0').slice(-5).toLowerCase();
 }
 
+function crc32Bytes(u8) {
+    if (typeof pako !== 'undefined' && pako.crc32) {
+        return (pako.crc32(u8) >>> 0);
+    }
+    let crc = 0xFFFFFFFF;
+    for (let i = 0; i < u8.length; i++) {
+        crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ u8[i]) & 0xFF];
+    }
+    return ((crc ^ 0xFFFFFFFF) >>> 0);
+}
+
+// ===== Z85（比 Base64 更省空间：4 字节 → 5 字符）=====
+const Z85_ENC = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#';
+const Z85_DEC = (() => {
+    const map = new Int16Array(128).fill(-1);
+    for (let i = 0; i < Z85_ENC.length; i++) map[Z85_ENC.charCodeAt(i)] = i;
+    return map;
+})();
+
+function z85Encode(bytes) {
+    const pad = (4 - (bytes.length % 4)) % 4;
+    const src = pad ? new Uint8Array(bytes.length + pad) : bytes;
+    if (pad) src.set(bytes);
+    const view = new DataView(src.buffer, src.byteOffset, src.byteLength);
+    let out = '';
+    for (let i = 0; i < src.length; i += 4) {
+        let value = view.getUint32(i);
+        const chars = new Array(5);
+        for (let j = 0; j < 5; j++) {
+            chars[4 - j] = Z85_ENC[value % 85];
+            value = Math.floor(value / 85);
+        }
+        out += chars.join('');
+    }
+    return out;
+}
+
+function z85Decode(str) {
+    if (str.length % 5 !== 0) throw new Error('Z85 长度无效');
+    const out = new Uint8Array((str.length / 5) * 4);
+    const view = new DataView(out.buffer);
+    for (let i = 0, o = 0; i < str.length; i += 5, o += 4) {
+        let value = 0;
+        for (let j = 0; j < 5; j++) {
+            const code = str.charCodeAt(i + j);
+            const d = code < 128 ? Z85_DEC[code] : -1;
+            if (d < 0) throw new Error('Z85 字符无效');
+            value = value * 85 + d;
+        }
+        view.setUint32(o, value >>> 0);
+    }
+    return out;
+}
+
+/** Q2 协议前缀；二维码文本 = Q2 + z85(二进制包) */
+const Q2_PREFIX = 'Q2';
+const Q2_TYPE_DATA = 0;
+const Q2_TYPE_FILENAME = 1;
+
+function normalizeFingerprint(fp) {
+    const s = String(fp || '');
+    if (s.length === 5) return s;
+    return (s + '00000').slice(0, 5);
+}
+
+function packQ2DataChunk(index, total, fingerprint, payload) {
+    const fp = normalizeFingerprint(fingerprint);
+    const buf = new Uint8Array(20 + payload.length);
+    const dv = new DataView(buf.buffer);
+    dv.setUint8(0, Q2_TYPE_DATA);
+    dv.setUint32(1, index >>> 0);
+    dv.setUint32(5, total >>> 0);
+    for (let i = 0; i < 5; i++) buf[9 + i] = fp.charCodeAt(i) & 0xff;
+    dv.setUint32(14, crc32Bytes(payload));
+    dv.setUint16(18, payload.length);
+    buf.set(payload, 20);
+    return Q2_PREFIX + z85Encode(buf);
+}
+
+function packQ2FilenameChunk(fingerprint, filename, size, totalChunks, timestamp) {
+    const fp = normalizeFingerprint(fingerprint);
+    const nameBytes = new TextEncoder().encode(filename);
+    const bodyLen = 20 + nameBytes.length;
+    const packet = new Uint8Array(bodyLen + 4);
+    const dv = new DataView(packet.buffer);
+    dv.setUint8(0, Q2_TYPE_FILENAME);
+    for (let i = 0; i < 5; i++) packet[1 + i] = fp.charCodeAt(i) & 0xff;
+    dv.setUint32(6, size >>> 0);
+    dv.setUint32(10, timestamp >>> 0);
+    dv.setUint32(14, totalChunks >>> 0);
+    dv.setUint16(18, nameBytes.length);
+    packet.set(nameBytes, 20);
+    dv.setUint32(bodyLen, crc32Bytes(packet.subarray(0, bodyLen)));
+    return Q2_PREFIX + z85Encode(packet);
+}
+
+function unpackQ2Packet(text) {
+    if (!text || !text.startsWith(Q2_PREFIX)) return null;
+    const raw = z85Decode(text.slice(Q2_PREFIX.length));
+    if (raw.length < 1) throw new Error('Q2 包过短');
+    const type = raw[0];
+    const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+
+    if (type === Q2_TYPE_DATA) {
+        if (raw.length < 20) throw new Error('Q2 数据包过短');
+        const index = dv.getUint32(1);
+        const total = dv.getUint32(5);
+        let fp = '';
+        for (let i = 0; i < 5; i++) fp += String.fromCharCode(raw[9 + i]);
+        const crc = dv.getUint32(14);
+        const payloadLen = dv.getUint16(18);
+        if (raw.length < 20 + payloadLen) throw new Error('Q2 载荷长度不匹配');
+        const payload = raw.subarray(20, 20 + payloadLen);
+        if (crc32Bytes(payload) !== crc) throw new Error('Q2 校验失败');
+        return { type: 'data', i: index, t: total, f: fp, payload };
+    }
+
+    if (type === Q2_TYPE_FILENAME) {
+        if (raw.length < 24) throw new Error('Q2 文件名包过短');
+        let fp = '';
+        for (let i = 0; i < 5; i++) fp += String.fromCharCode(raw[1 + i]);
+        const size = dv.getUint32(6);
+        const ts = dv.getUint32(10);
+        const tc = dv.getUint32(14);
+        const nameLen = dv.getUint16(18);
+        const bodyLen = 20 + nameLen;
+        if (raw.length < bodyLen + 4) throw new Error('Q2 文件名长度不匹配');
+        const crc = dv.getUint32(bodyLen);
+        if (crc32Bytes(raw.subarray(0, bodyLen)) !== crc) throw new Error('Q2 文件名校验失败');
+        const nameBytes = raw.subarray(20, bodyLen);
+        const filename = new TextDecoder('utf-8').decode(nameBytes);
+        return { type: 'fn', f: fp, s: size, ts, tc, filename };
+    }
+
+    throw new Error('未知 Q2 类型');
+}
+
 // 分块 base64 编码，避免大数组展开导致调用栈溢出
 function uint8ArrayToBase64(uint8Array) {
     const CHUNK = 8192;

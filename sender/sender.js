@@ -1,9 +1,9 @@
 // ===== 配置 =====
 const CONFIG = {
-    CHUNK_SIZE: 2100,
+    CHUNK_SIZE: 2200,
     QR_SIZE: 2000,
     QR_MAX_CAPACITY: 2953,
-    AUTOPLAY_INTERVAL: 500,
+    AUTOPLAY_INTERVAL: 100,
     PACKET_TYPES: { DATA: 'data', FILENAME: 'fn' }
 };
 
@@ -19,6 +19,10 @@ let fileNameQrCode = null;
 let autoplayTimer = null;
 let isPlaying = false;
 let hasGenerated = false;
+/** index -> canvas；仅缓存当前附近几帧，避免大文件占满内存 */
+const qrCanvasCache = new Map();
+const QR_PRERENDER_AHEAD = 6;
+let prerenderScheduled = false;
 
 // ===== DOM 引用 =====
 const uploadArea    = document.getElementById('uploadArea');
@@ -100,6 +104,7 @@ const qrSizeHint   = document.getElementById('qrSizeHint');
 document.getElementById('qrSizeSlider').addEventListener('input', function () {
     CONFIG.QR_SIZE = parseInt(this.value);
     document.getElementById('qrSizeValue').textContent = CONFIG.QR_SIZE + ' px';
+    clearQRCanvasCache();
     if (hasGenerated) qrSizeHint.classList.add('show');
 });
 
@@ -118,7 +123,7 @@ function updateChunkEstimation() {
 // ===== 播放间隔 =====
 document.getElementById('intervalConfirmBtn').addEventListener('click', () => {
     const raw = parseInt(document.getElementById('intervalInput').value);
-    CONFIG.AUTOPLAY_INTERVAL = Math.max(100, Math.min(60000, isNaN(raw) ? 500 : raw));
+    CONFIG.AUTOPLAY_INTERVAL = Math.max(100, Math.min(60000, isNaN(raw) ? 100 : raw));
     document.getElementById('intervalInput').value = CONFIG.AUTOPLAY_INTERVAL;
     document.getElementById('intervalAppliedValue').textContent = CONFIG.AUTOPLAY_INTERVAL;
     document.getElementById('intervalAppliedHint').classList.add('show');
@@ -162,19 +167,10 @@ async function processFileChunks(compressed) {
     for (let i = 0; i < totalChunks; i++) {
         const start = i * CONFIG.CHUNK_SIZE;
         const chunkData = compressedArray.slice(start, Math.min(start + CONFIG.CHUNK_SIZE, compressed.length));
-        const base64Data = uint8ArrayToBase64(chunkData);
+        const qrText = packQ2DataChunk(i, totalChunks, fileFingerprint, chunkData);
 
-        const chunkObj = {
-            i: i,
-            t: totalChunks,
-            h: calculateCRC32(base64Data),
-            f: fileFingerprint,
-            d: base64Data
-        };
-
-        const jsonStr = JSON.stringify(chunkObj);
-        if (jsonStr.length > CONFIG.QR_MAX_CAPACITY) {
-            const suggested = Math.max(200, Math.floor(CONFIG.CHUNK_SIZE / (jsonStr.length / CONFIG.QR_MAX_CAPACITY) * 0.8));
+        if (qrText.length > CONFIG.QR_MAX_CAPACITY) {
+            const suggested = Math.max(200, Math.floor(CONFIG.CHUNK_SIZE / (qrText.length / CONFIG.QR_MAX_CAPACITY) * 0.8));
             showStatus('status', `分片 ${i+1} 数据过大，建议将分片大小调整为 ${suggested} B`, 'error');
             chunkSizeSlider.value = suggested;
             chunkSizeValue.textContent = suggested + ' B';
@@ -184,7 +180,7 @@ async function processFileChunks(compressed) {
             return;
         }
 
-        chunks.push(chunkObj);
+        chunks.push({ qrText, i, t: totalChunks });
 
         if (i % Math.max(1, Math.floor(totalChunks / 10)) === 0) {
             showStatus('status', `分片进度: ${i+1}/${totalChunks}`, 'info');
@@ -193,8 +189,8 @@ async function processFileChunks(compressed) {
     }
 
     // 计算最小安全 QR 尺寸（每模块至少 4px）
-    const maxJsonLen = Math.max(...chunks.map(c => JSON.stringify(c).length));
-    const estimatedVersion = maxJsonLen < 1000 ? 25 : maxJsonLen < 1209 ? 30 : maxJsonLen < 1520 ? 35 : 40;
+    const maxTextLen = Math.max(...chunks.map(c => c.qrText.length));
+    const estimatedVersion = maxTextLen < 1000 ? 25 : maxTextLen < 1209 ? 30 : maxTextLen < 1520 ? 35 : 40;
     const minSafeSize = (17 + 4 * estimatedVersion) * 4;
     if (CONFIG.QR_SIZE < minSafeSize) {
         CONFIG.QR_SIZE = minSafeSize;
@@ -210,26 +206,33 @@ async function processFileChunks(compressed) {
 }
 
 function createFileNameQrCode(totalChunks) {
-    const encodedFileName = encodeFileName(originalFileName);
-    const fnData = {
-        t: CONFIG.PACKET_TYPES.FILENAME,
-        f: fileFingerprint,
-        n: encodedFileName,
-        s: originalFileSize,
-        ts: Date.now(),
-        tc: totalChunks
+    fileNameQrCode = {
+        qrText: packQ2FilenameChunk(
+            fileFingerprint,
+            originalFileName,
+            originalFileSize,
+            totalChunks,
+            Date.now() >>> 0
+        )
     };
-    fnData.h = calculateCRC32(JSON.stringify({
-        t: fnData.t, f: fnData.f, n: fnData.n, s: fnData.s, ts: fnData.ts, tc: fnData.tc
-    }));
-    fileNameQrCode = fnData;
 }
 
 async function generateQRCodeSequence() {
     qrSection.classList.add('show');
     currentChunkIndex = 0;
-    qrCodes = chunks.map((c, i) => ({ data: c, type: CONFIG.PACKET_TYPES.DATA, index: i }));
-    qrCodes.push({ data: fileNameQrCode, type: CONFIG.PACKET_TYPES.FILENAME, index: chunks.length });
+    clearQRCanvasCache();
+    qrCodes = chunks.map((c, i) => ({
+        qrText: c.qrText,
+        data: c,
+        type: CONFIG.PACKET_TYPES.DATA,
+        index: i
+    }));
+    qrCodes.push({
+        qrText: fileNameQrCode.qrText,
+        data: fileNameQrCode,
+        type: CONFIG.PACKET_TYPES.FILENAME,
+        index: chunks.length
+    });
 
     const totalQR = qrCodes.length;
     document.getElementById('totalQrCount').textContent = totalQR;
@@ -265,6 +268,84 @@ chunkJumpInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') jumpToChunk();
 });
 
+function clearQRCanvasCache() {
+    qrCanvasCache.clear();
+    prerenderScheduled = false;
+}
+
+function buildQRCanvas(qrEntry) {
+    const holder = document.createElement('div');
+    const text = qrEntry.qrText || JSON.stringify(qrEntry.data);
+    new QRCode(holder, {
+        text,
+        width: CONFIG.QR_SIZE,
+        height: CONFIG.QR_SIZE,
+        colorDark: '#000000',
+        colorLight: '#ffffff',
+        correctLevel: QRCode.CorrectLevel.L
+    });
+    const src = holder.querySelector('canvas');
+    if (!src) return null;
+    const canvas = document.createElement('canvas');
+    canvas.width = src.width;
+    canvas.height = src.height;
+    canvas.getContext('2d').drawImage(src, 0, 0);
+    return canvas;
+}
+
+function getCachedQRCanvas(index) {
+    let canvas = qrCanvasCache.get(index);
+    if (canvas) return canvas;
+    if (!qrCodes[index]) return null;
+    canvas = buildQRCanvas(qrCodes[index]);
+    if (canvas) qrCanvasCache.set(index, canvas);
+    return canvas;
+}
+
+function pruneQRCanvasCache(center) {
+    const total = qrCodes.length;
+    if (!total) {
+        qrCanvasCache.clear();
+        return;
+    }
+    const keep = new Set();
+    for (let d = -1; d <= QR_PRERENDER_AHEAD; d++) {
+        keep.add((center + d + total) % total);
+    }
+    for (const key of [...qrCanvasCache.keys()]) {
+        if (!keep.has(key)) qrCanvasCache.delete(key);
+    }
+}
+
+function schedulePrerenderAround(index) {
+    if (prerenderScheduled || !qrCodes.length) return;
+    prerenderScheduled = true;
+
+    const run = () => {
+        prerenderScheduled = false;
+        if (!qrCodes.length) return;
+        const total = qrCodes.length;
+        for (let d = 1; d <= QR_PRERENDER_AHEAD; d++) {
+            const i = (index + d) % total;
+            if (!qrCanvasCache.has(i)) {
+                getCachedQRCanvas(i);
+                if (d < QR_PRERENDER_AHEAD) {
+                    prerenderScheduled = true;
+                    setTimeout(run, 0);
+                }
+                return;
+            }
+        }
+    };
+    setTimeout(run, 0);
+}
+
+/** 确保指定帧已渲染；未命中缓存时同步生成，避免播放时卡顿 */
+function ensureQRCanvasReady(index) {
+    if (!qrCodes[index]) return null;
+    return getCachedQRCanvas(index);
+}
+
 function showQRCode(index) {
     currentChunkIndex = index;
     const qrData = qrCodes[index];
@@ -276,27 +357,28 @@ function showQRCode(index) {
     if (!qrEl) {
         qrContainer.innerHTML = '<div id="qrcode"></div>';
         qrEl = document.getElementById('qrcode');
-    } else {
-        qrEl.innerHTML = '';
     }
 
-    new QRCode(qrEl, {
-        text: JSON.stringify(qrData.data),
-        width: CONFIG.QR_SIZE,
-        height: CONFIG.QR_SIZE,
-        colorDark: '#000000',
-        colorLight: '#ffffff',
-        correctLevel: QRCode.CorrectLevel.L
-    });
+    const canvas = ensureQRCanvasReady(index);
+    while (qrEl.firstChild) qrEl.removeChild(qrEl.firstChild);
+    if (canvas) qrEl.appendChild(canvas);
 
     document.getElementById('qrCounter').textContent = `${index + 1} / ${qrCodes.length}`;
 
     const qrType = document.getElementById('qrType');
-    qrType.textContent = isFilename ? '文件名分片' : `数据分片 ${qrData.data.i + 1}/${qrData.data.t}`;
+    if (isFilename) {
+        qrType.textContent = '文件名分片';
+    } else {
+        const i = (qrData.data && qrData.data.i != null) ? qrData.data.i : index;
+        const t = (qrData.data && qrData.data.t != null) ? qrData.data.t : chunks.length;
+        qrType.textContent = `数据分片 ${i + 1}/${t}`;
+    }
     qrType.className = 'qr-type ' + (isFilename ? 'filename' : 'data');
     document.getElementById('qrHint').textContent = isFilename ? '⚠️ 请最后扫描此二维码' : '请使用接收端扫描此二维码';
 
     updateJumpControls(index);
+    pruneQRCanvasCache(index);
+    schedulePrerenderAround(index);
 }
 
 // ===== 导航 =====
@@ -325,12 +407,24 @@ function clearAutoplayTimer() {
     }
 }
 
+/**
+ * 自适应播放：固定展示 interval 后切换；
+ * 若下一帧尚未预渲染完成，先生成再切，避免“空等 interval 却卡在编码”的双重等待。
+ */
 function scheduleNextAutoplay() {
     clearAutoplayTimer();
+    if (!isPlaying || !qrCodes.length) return;
+
+    const nextIndex = (currentChunkIndex + 1) % qrCodes.length;
+    schedulePrerenderAround(currentChunkIndex);
+
     autoplayTimer = setTimeout(() => {
         autoplayTimer = null;
         if (!isPlaying || !qrCodes.length) return;
-        showQRCode((currentChunkIndex + 1) % qrCodes.length);
+
+        // 就绪驱动：切换前确保下一帧 canvas 已就绪
+        ensureQRCanvasReady(nextIndex);
+        showQRCode(nextIndex);
         scheduleNextAutoplay();
     }, CONFIG.AUTOPLAY_INTERVAL);
 }
@@ -341,6 +435,8 @@ function startAutoplay() {
     playBtn.textContent = '⏸ 暂停';
     autoplayToggle.checked = true;
     autoplayStatus.textContent = '开启';
+    // 启动时先预热后续几帧
+    schedulePrerenderAround(currentChunkIndex);
     scheduleNextAutoplay();
 }
 
@@ -393,7 +489,7 @@ document.getElementById('downloadAllBtn').addEventListener('click', async () => 
             const tempDiv = document.createElement('div');
 
             new QRCode(tempDiv, {
-                text: JSON.stringify(qr.data),
+                text: qr.qrText || JSON.stringify(qr.data),
                 width: CONFIG.QR_SIZE,
                 height: CONFIG.QR_SIZE,
                 colorDark: '#000000',
@@ -433,6 +529,7 @@ resetBtn.addEventListener('click', () => {
     file = null; chunks = []; qrCodes = []; currentChunkIndex = 0;
     fileFingerprint = ''; originalFileName = ''; originalFileSize = 0;
     fileNameQrCode = null; hasGenerated = false;
+    clearQRCanvasCache();
 
     fileInput.value = '';
     uploadArea.classList.remove('has-file');
@@ -447,9 +544,9 @@ resetBtn.addEventListener('click', () => {
     downloadSection.classList.remove('show');
     generateBtn.disabled = true;
 
-    chunkSizeSlider.value = 2100;
-    chunkSizeValue.textContent = '2100 B';
-    CONFIG.CHUNK_SIZE = 2100;
+    chunkSizeSlider.value = 2200;
+    chunkSizeValue.textContent = '2200 B';
+    CONFIG.CHUNK_SIZE = 2200;
 
     document.getElementById('qrSizeSlider').value = 2000;
     document.getElementById('qrSizeValue').textContent = '2000 px';

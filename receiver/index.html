@@ -185,6 +185,12 @@
     </script>
     <script src="../js/zxing-wasm-reader.js"></script>
     <script>
+        // 主线程一份 + Worker 池各一份（需独立 ArrayBuffer，不可 transfer 共享）
+        window.__QRSyncWasmBinaryCopies = [
+            _wasmBinary.slice(0),
+            _wasmBinary.slice(0),
+            _wasmBinary.slice(0)
+        ];
         ZXingWASM.setZXingModuleOverrides({ wasmBinary: _wasmBinary });
         _wasmBinary = null;
         // 预热 wasm，标记就绪状态
