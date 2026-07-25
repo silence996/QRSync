@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>QRSync - 发送端</title>
     <link rel="stylesheet" href="../shared/theme.css">
-    <link rel="stylesheet" href="sender.css?v=20260726-single1">
+    <link rel="stylesheet" href="sender.css?v=20260726-single5">
 </head>
 <body>
     <nav>
@@ -94,7 +94,7 @@
                 <div class="interval-applied-hint" id="intervalAppliedHint">
                     ✅ 已设置为 <span id="intervalAppliedValue">500</span> ms
                 </div>
-                <p class="interval-hint">默认 500ms；单码模式，每间隔切换一张二维码</p>
+                <p class="interval-hint">默认 500ms；每间隔切换一张二维码</p>
             </div>
 
             <div class="progress-section">
@@ -148,19 +148,17 @@
                         <div class="qr-container data-qr" id="qrContainer">
                             <div id="qrcode"></div>
                         </div>
+                        <div class="chunks-jump-row" id="chunkJumpRow">
+                            <span class="chunks-jump-label">跳转到</span>
+                            <input type="text" id="chunkJumpInput" placeholder="5 或 3,4,5-7" autocomplete="off" spellcheck="false">
+                            <button type="button" class="chunks-jump-btn" id="chunkJumpBtn">确定</button>
+                            <button type="button" class="chunks-jump-btn" id="chunkJumpNextBtn">下一缺口</button>
+                            <span class="chunks-jump-status" id="gapJumpStatus"></span>
+                        </div>
                     </div>
                     <div class="qr-stage-hud" id="qrStageHud">
                         <div class="qr-info">
                             <div class="qr-counter" id="qrCounter">1 / 10</div>
-                            <span class="qr-type data" id="qrType">数据分片</span>
-                            <div class="qr-hint" id="qrHint">请使用接收端扫描此二维码</div>
-                        </div>
-                        <div class="chunks-jump-row" id="chunkJumpRow">
-                            <span class="chunks-jump-label">分片号</span>
-                            <input type="text" id="chunkJumpInput" placeholder="5 或 3,4,5-7" autocomplete="off" spellcheck="false">
-                            <button type="button" class="chunks-jump-btn" id="chunkJumpBtn">跳转</button>
-                            <button type="button" class="chunks-jump-btn" id="chunkJumpNextBtn">下一缺口</button>
-                            <span class="chunks-jump-status" id="gapJumpStatus"></span>
                         </div>
                         <div class="qr-stage-actions">
                             <button type="button" class="qr-nav-btn" id="stagePrevBtn">←</button>
@@ -192,8 +190,8 @@
     <script src="../js/qrcode.min.js"></script>
     <script src="../js/jszip.min.js"></script>
     <!-- 共享工具函数 -->
-    <script src="../shared/utils.js?v=20260726-single1"></script>
+    <script src="../shared/utils.js?v=20260726-single5"></script>
     <!-- 发送端逻辑 -->
-    <script src="sender.js?v=20260726-single1"></script>
+    <script src="sender.js?v=20260726-single5"></script>
 </body>
 </html>

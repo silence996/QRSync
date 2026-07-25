@@ -250,7 +250,7 @@ async function generateQRCodeSequence() {
 
     generateBtn.disabled = false;
     generateBtn.innerHTML = '<span>生成二维码</span>';
-    showToast('二维码生成完成（单码模式）；已进入整屏，Esc 退出');
+    showToast('二维码生成完成；已进入整屏，Esc 退出');
     enterQrImmersive();
 }
 
@@ -489,8 +489,8 @@ function showQRPage(pageIndex) {
         qrContainer.innerHTML = '<div id="qrcode"></div>';
         qrEl = document.getElementById('qrcode');
     }
-    qrEl.className = 'qr-grid-inner qr-single';
-    qrEl.style.gridTemplateColumns = '1fr';
+    qrEl.className = 'qr-single';
+    qrEl.style.gridTemplateColumns = '';
     while (qrEl.firstChild) qrEl.removeChild(qrEl.firstChild);
 
     const q = qrCodes[page];
@@ -515,29 +515,7 @@ function showQRPage(pageIndex) {
     }
     qrEl.appendChild(cell);
 
-    let label = '';
-    if (isFn) {
-        label = '文件名码';
-        document.getElementById('qrCounter').textContent =
-            `${page + 1} / ${pages} · 文件名`;
-        document.getElementById('qrHint').textContent =
-            '⚠️ 请扫描文件名二维码';
-    } else if (q) {
-        const i = (q.data && q.data.i != null) ? q.data.i : page;
-        const t = (q.data && q.data.t != null) ? q.data.t : chunks.length;
-        label = (i + 1) + '/' + t;
-        document.getElementById('qrCounter').textContent =
-            `${page + 1} / ${pages} · 分片 ${label}`;
-        document.getElementById('qrHint').textContent =
-            '单码模式：请对准扫描框扫描';
-    } else {
-        document.getElementById('qrCounter').textContent = `${page + 1} / ${pages}`;
-        document.getElementById('qrHint').textContent = '';
-    }
-
-    const qrType = document.getElementById('qrType');
-    qrType.textContent = label || '空';
-    qrType.className = 'qr-type ' + (isFn ? 'filename' : 'data');
+    document.getElementById('qrCounter').textContent = `${page + 1} / ${pages}`;
 
     // 跳转高亮：当前数据分片匹配目标时描边
     if (isFn || !q || !q.data || (q.data.i + 1) !== highlightChunk1) {
