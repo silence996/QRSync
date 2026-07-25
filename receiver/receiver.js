@@ -66,61 +66,152 @@ let decodeWorkerReady = false;
 let decodeReqId = 0;
 const pendingDecodes = new Map();
 
-function createDecodeWorker(wasmBinary) {
-    return new Promise((resolve) => {
-        let worker;
-        try {
-            worker = new Worker('decode-worker.js');
-        } catch (err) {
-            console.warn('[decode-worker] 创建失败:', err.message);
-            resolve(null);
-            return;
+/** file:// 下缓存的 Blob Worker 脚本 URL；http(s) 则为 decode-worker.js */
+let decodeWorkerScriptUrl = null;
+let decodeWorkerScriptPromise = null;
+
+function loadScriptOnce(src) {
+    return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error('脚本加载失败: ' + src));
+        document.head.appendChild(s);
+    });
+}
+
+/**
+ * file:// 无法 XHR/直接 Worker 本地脚本（Chrome CORS origin=null）。
+ * 改为 <script src> 加载预生成的 decode-worker-source.js，再 Blob 创建 Worker。
+ * http(s) 仍使用 decode-worker.js + importScripts。
+ */
+async function ensureDecodeWorkerScriptUrl() {
+    if (decodeWorkerScriptUrl) return decodeWorkerScriptUrl;
+    if (decodeWorkerScriptPromise) return decodeWorkerScriptPromise;
+
+    decodeWorkerScriptPromise = (async () => {
+        if (location.protocol !== 'file:') {
+            decodeWorkerScriptUrl = 'decode-worker.js';
+            return decodeWorkerScriptUrl;
         }
 
+        console.log('[decode-worker] file:// 模式：加载 decode-worker-source.js → Blob Worker');
+        const t0 = performance.now();
+        if (!window.__QRSyncDecodeWorkerSource) {
+            await loadScriptOnce('decode-worker-source.js?v=20260726-blob2');
+        }
+        const source = window.__QRSyncDecodeWorkerSource;
+        if (!source || typeof source !== 'string') {
+            throw new Error(
+                '缺少 __QRSyncDecodeWorkerSource。请确认存在 receiver/decode-worker-source.js，' +
+                '或运行 tools/build-decode-worker-source.ps1 重新生成'
+            );
+        }
+
+        const blob = new Blob([source], { type: 'application/javascript' });
+        decodeWorkerScriptUrl = URL.createObjectURL(blob);
+        console.log(
+            `[decode-worker] Blob Worker 已构建 ${(performance.now() - t0).toFixed(0)}ms` +
+            ` size≈${(blob.size / 1024).toFixed(0)}KB`
+        );
+        return decodeWorkerScriptUrl;
+    })();
+
+    try {
+        return await decodeWorkerScriptPromise;
+    } catch (err) {
+        decodeWorkerScriptPromise = null;
+        throw err;
+    }
+}
+
+function createDecodeWorker(wasmBinary) {
+    return new Promise((resolve) => {
         let settled = false;
-        const finish = (ok) => {
+        const finish = (ok, worker) => {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
             resolve(ok ? worker : null);
         };
-        const timer = setTimeout(() => finish(false), 12000);
+        const timer = setTimeout(() => finish(false, null), 20000);
 
-        worker.onmessage = (event) => {
-            const msg = event.data;
-            if (!msg) return;
-            if (msg.type === 'ready') {
-                finish(true);
-                return;
-            }
-            if (msg.type === 'result') {
-                const pending = pendingDecodes.get(msg.id);
-                if (!pending) return;
-                pendingDecodes.delete(msg.id);
-                idleWorkers.push(worker);
-                pending.resolve(msg.text || null);
-            }
-        };
-        worker.onerror = (err) => {
-            console.warn('[decode-worker] 错误:', err.message);
-            finish(false);
-        };
+        ensureDecodeWorkerScriptUrl()
+            .then((scriptUrl) => {
+                let worker;
+                try {
+                    worker = new Worker(scriptUrl);
+                } catch (err) {
+                    console.warn('[decode-worker] 创建失败:', err.message);
+                    finish(false, null);
+                    return;
+                }
 
-        worker.postMessage({ type: 'init', wasmBinary }, [wasmBinary]);
+                worker.onmessage = (event) => {
+                    const msg = event.data;
+                    if (!msg) return;
+                    if (msg.type === 'ready') {
+                        console.log(
+                            '[decode-worker] worker ready wasmReady=' + !!msg.wasmReady +
+                            (location.protocol === 'file:' ? ' (Blob)' : '')
+                        );
+                        finish(true, worker);
+                        return;
+                    }
+                    if (msg.type === 'result') {
+                        const pending = pendingDecodes.get(msg.id);
+                        if (!pending) return;
+                        pendingDecodes.delete(msg.id);
+                        idleWorkers.push(worker);
+                        pending.resolve(msg.text || null);
+                    }
+                };
+                worker.onerror = (err) => {
+                    console.warn('[decode-worker] 错误:', err.message || err);
+                    finish(false, null);
+                };
+
+                worker.postMessage({ type: 'init', wasmBinary }, [wasmBinary]);
+            })
+            .catch((err) => {
+                console.warn('[decode-worker] 脚本准备失败:', err.message);
+                finish(false, null);
+            });
     });
 }
 
+let wasmBinaryCopies = null;
+
 async function initDecodeWorker() {
-    const copies = window.__QRSyncWasmBinaryCopies;
-    window.__QRSyncWasmBinaryCopies = null;
-    if (typeof Worker === 'undefined' || !copies || !copies.length) {
+    if (decodeWorkerReady && decodeWorkers.length > 0) {
+        return true;
+    }
+
+    if (!wasmBinaryCopies) {
+        wasmBinaryCopies = window.__QRSyncWasmBinaryCopies || null;
+        window.__QRSyncWasmBinaryCopies = null;
+    }
+    const copies = wasmBinaryCopies;
+
+    if (typeof Worker === 'undefined') {
+        console.warn('[decode-worker] ⚠️ 环境不支持 Worker，回退主线程');
+        return false;
+    }
+    if (!copies || !copies.length) {
+        console.warn('[decode-worker] ⚠️ 无 wasm 副本，回退主线程（请硬刷新页面）');
         return false;
     }
 
-    const count = Math.min(DECODE_WORKER_COUNT, copies.length);
+    const want = Math.max(2, SCAN_TUNING.workerInflight | 0);
+    const count = Math.min(DECODE_WORKER_COUNT, want, copies.length);
+    console.log(`[decode-worker] 正在初始化 x${count} (loader=file-blob-v2, protocol=${location.protocol}) ...`);
+
     const workers = await Promise.all(
         copies.slice(0, count).map((buf) => createDecodeWorker(buf))
     );
+    // 已 transfer 的副本不能复用
+    wasmBinaryCopies = copies.length > count ? copies.slice(count) : null;
+
     decodeWorkers = workers.filter(Boolean);
     idleWorkers = decodeWorkers.slice();
     decodeWorkerReady = decodeWorkers.length > 0;
@@ -448,8 +539,11 @@ function startScanLoop(video) {
 
     function currentInflightLimit() {
         const want = Math.max(1, SCAN_TUNING.workerInflight | 0);
-        const pool = Math.max(1, decodeWorkers.length || 1);
-        return Math.min(want, pool);
+        // Worker 池可用时不超过池大小；无 Worker 时仍按配置并行（主线程路径）
+        if (decodeWorkers.length > 0) {
+            return Math.min(want, decodeWorkers.length);
+        }
+        return want;
     }
 
     function logScanStats(force) {
@@ -458,9 +552,12 @@ function startScanLoop(video) {
         lastStatsLogAt = now;
         const avg = DECODE_TIMING.n ? DECODE_TIMING.sum / DECODE_TIMING.n : 0;
         const workers = currentInflightLimit();
+        const path = decodeWorkerReady ? 'worker' : 'MAIN';
         console.log(
             `[scan] q=${frameQueue.length}/${SCAN_TUNING.queueMax}` +
             ` inflight=${inflight}/${workers}` +
+            ` path=${path}` +
+            ` pool=${decodeWorkers.length}` +
             ` enq=${qStats.enqueued} deq=${qStats.dequeued}` +
             ` dropFull=${qStats.dropFull} dropDedupe=${qStats.dropDedupe}` +
             ` decodeAvg=${avg.toFixed(1)}ms` +
@@ -550,9 +647,18 @@ function startScanLoop(video) {
             frameDedupe: SCAN_TUNING.frameDedupe,
             decodeMaxEdge: SCAN_TUNING.decodeMaxEdge,
             targetIntervalMs: SCAN_TUNING.targetIntervalMs,
-            poolSize: decodeWorkers.length
+            poolSize: decodeWorkers.length,
+            workerReady: decodeWorkerReady,
+            inflightLimit: currentInflightLimit(),
+            decodePath: decodeWorkerReady ? 'worker' : 'MAIN-THREAD (无并行 Worker)'
         }
     );
+    if (!decodeWorkerReady) {
+        console.warn(
+            '[scan] ⚠️ Worker 池未就绪，当前走主线程 ZXing；' +
+            '日志里会看到 via=main-zxing 且难以真正双并行。请确认页面有 [decode-worker] ✅ 池已就绪'
+        );
+    }
     console.log(
         '[scan] 运行时可调: window.QRSyncScanTuning.' +
         '{workerInflight,queueMax,sampleIntervalMs,frameDedupe,decodeMaxEdge,targetIntervalMs}'
@@ -651,6 +757,11 @@ async function startCamera() {
         document.getElementById('btn-start').disabled = true;
         document.getElementById('scan-btn-text').textContent = '⏳ 启动中...';
         document.getElementById('resolution-actual').textContent = '';
+
+        if (!decodeWorkerReady) {
+            console.warn('[scan] 启动前 Worker 未就绪，尝试 initDecodeWorker()');
+            await initDecodeWorker();
+        }
 
         const { stream, actual } = await tryOpenStream(deviceId || null, candidates);
 
