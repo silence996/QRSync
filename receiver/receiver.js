@@ -34,18 +34,22 @@ const SCAN_TUNING = {
      * 2 路容易在 HIT 后仍有 in-flight DUP。难扫可改为 2。
      */
     workerInflight: 1,
-    /** 帧队列最大长度；满则背压丢弃新帧 */
-    queueMax: 6,
-    /** 入队采样间隔 ms（仅控制采帧密度，不跟随发送间隔） */
-    sampleIntervalMs: 25,
+    /** 帧队列最大长度；4K 单帧约 33MB，队列宜短 */
+    queueMax: 2,
+    /** 入队采样间隔 ms（4K 解码更重，略放宽） */
+    sampleIntervalMs: 40,
     /**
      * 指纹去重：
      * true = 仅抑制「上一张 HIT 成功」的同指纹（MISS 可重试同画面）
      * false = 完全不去重
      */
     frameDedupe: true,
-    /** 解码最长边上限（全幅取景，双码需保留横向） */
-    decodeMaxEdge: 960
+    /**
+     * 解码最长边上限。
+     * 0 = 不降采样，按摄像头原生分辨率（4K 直接 3840×2160 解码）。
+     * 需要降采样时可设为 1600 等。
+     */
+    decodeMaxEdge: 0
 };
 window.QRSyncScanTuning = SCAN_TUNING;
 
@@ -57,7 +61,10 @@ const DECODE_WORKER_COUNT = 3;
 const SAME_TEXT_DEBOUNCE_MS = 80;
 
 function getDecodeMaxEdge() {
-    return SCAN_TUNING.decodeMaxEdge || 560;
+    const v = SCAN_TUNING.decodeMaxEdge;
+    // 0 / 负数 / 未设：不限制（原生分辨率）
+    if (v == null || v <= 0) return 0;
+    return v | 0;
 }
 
 const DB = localforage.createInstance({ name: 'qrcode-receiver-v2' });
@@ -98,13 +105,8 @@ async function ensureDecodeWorkerScriptUrl() {
             return decodeWorkerScriptUrl;
         }
 
-        if (location.protocol !== 'file:') {
-            decodeWorkerScriptUrl = 'decode-worker.js';
-            return decodeWorkerScriptUrl;
-        }
-
         if (!window.__QRSyncDecodeWorkerSource) {
-            await loadScriptOnce('decode-worker-source.js?v=20260726-abc3');
+            await loadScriptOnce('decode-worker-source.js?v=20260726-abc10');
         }
         const source = window.__QRSyncDecodeWorkerSource;
         if (!source || typeof source !== 'string') {
@@ -306,9 +308,11 @@ function resizeCanvas(canvas, width, height) {
     }
 }
 
-/** 将 ImageData 最长边限制在 decodeMaxEdge 以内 */
+/** 按 decodeMaxEdge 可选降采样；0 表示不降采样 */
 function prepareImageDataForDecode(imgData) {
     const maxEdge = getDecodeMaxEdge();
+    if (!maxEdge) return imgData;
+
     const maxDim = Math.max(imgData.width, imgData.height);
     if (maxDim <= maxEdge) return imgData;
 
@@ -344,7 +348,7 @@ function getZXingOptions(forceHard) {
     }
     return {
         formats: ['QRCode'],
-        tryHarder: false,
+        tryHarder: true,
         tryRotate: false,
         tryInvert: false,
         tryDownscale: false,
@@ -444,7 +448,7 @@ function formatResolutionLabel(actual) {
     return `${actual.width}×${actual.height} ${tag}`;
 }
 
-// 全幅采帧（保留横向双码）；最长边降到 decodeMaxEdge，不再裁中心正方形
+// 全幅采帧（保留横向双码）；decodeMaxEdge=0 时按摄像头原生分辨率，不降采样
 function captureFrame(video) {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
@@ -453,14 +457,19 @@ function captureFrame(video) {
     }
 
     const maxEdge = getDecodeMaxEdge();
-    const scale = Math.min(1, maxEdge / Math.max(vw, vh));
-    const dw = Math.max(1, Math.round(vw * scale));
-    const dh = Math.max(1, Math.round(vh * scale));
+    let dw = vw;
+    let dh = vh;
+    if (maxEdge > 0) {
+        const scale = Math.min(1, maxEdge / Math.max(vw, vh));
+        dw = Math.max(1, Math.round(vw * scale));
+        dh = Math.max(1, Math.round(vh * scale));
+    }
 
     ensureCropCanvas();
     resizeCanvas(cropCanvas, dw, dh);
-    cropCtx.imageSmoothingEnabled = scale < 1;
-    cropCtx.imageSmoothingQuality = 'medium';
+    const scaled = dw !== vw || dh !== vh;
+    cropCtx.imageSmoothingEnabled = scaled;
+    if (scaled) cropCtx.imageSmoothingQuality = 'high';
     cropCtx.drawImage(video, 0, 0, vw, vh, 0, 0, dw, dh);
     return cropCtx.getImageData(0, 0, dw, dh);
 }
