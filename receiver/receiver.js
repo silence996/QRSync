@@ -44,8 +44,8 @@ const SCAN_TUNING = {
      * false = 完全不去重
      */
     frameDedupe: true,
-    /** 解码边长上限 */
-    decodeMaxEdge: 800
+    /** 解码最长边上限（全幅取景，双码需保留横向） */
+    decodeMaxEdge: 960
 };
 window.QRSyncScanTuning = SCAN_TUNING;
 
@@ -444,21 +444,25 @@ function formatResolutionLabel(actual) {
     return `${actual.width}×${actual.height} ${tag}`;
 }
 
-// 从视频帧裁出中心正方形并降采样，与 CSS object-fit:cover 的裁剪一致
+// 全幅采帧（保留横向双码）；最长边降到 decodeMaxEdge，不再裁中心正方形
 function captureFrame(video) {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
-    const srcSize = Math.min(vw, vh);
-    const sx = Math.round((vw - srcSize) / 2);
-    const sy = Math.round((vh - srcSize) / 2);
-    const dstSize = Math.min(srcSize, getDecodeMaxEdge());
+    if (!vw || !vh) {
+        return new ImageData(1, 1);
+    }
+
+    const maxEdge = getDecodeMaxEdge();
+    const scale = Math.min(1, maxEdge / Math.max(vw, vh));
+    const dw = Math.max(1, Math.round(vw * scale));
+    const dh = Math.max(1, Math.round(vh * scale));
 
     ensureCropCanvas();
-    resizeCanvas(cropCanvas, dstSize, dstSize);
-    cropCtx.imageSmoothingEnabled = dstSize < srcSize;
+    resizeCanvas(cropCanvas, dw, dh);
+    cropCtx.imageSmoothingEnabled = scale < 1;
     cropCtx.imageSmoothingQuality = 'medium';
-    cropCtx.drawImage(video, sx, sy, srcSize, srcSize, 0, 0, dstSize, dstSize);
-    return cropCtx.getImageData(0, 0, dstSize, dstSize);
+    cropCtx.drawImage(video, 0, 0, vw, vh, 0, 0, dw, dh);
+    return cropCtx.getImageData(0, 0, dw, dh);
 }
 
 /** 廉价帧指纹，用于入队去重（粗量化，抑制相机噪声假换码） */

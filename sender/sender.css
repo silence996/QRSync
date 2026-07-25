@@ -346,12 +346,25 @@ body.qr-immersive .qr-display {
 
 body.qr-immersive .qr-stage {
     position: relative;
+    display: flex;
+    flex-direction: column;
     width: 100vw;
     height: 100vh;
     gap: 0;
+    background: #111;
 }
 
-body.qr-immersive .qr-code-block,
+/* 上方：二维码独占剩余高度，不与控件重叠 */
+body.qr-immersive .qr-code-block {
+    flex: 1 1 auto;
+    min-height: 0;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #fff;
+}
+
 body.qr-immersive .qr-container,
 body.qr-immersive #qrcode.qr-grid-inner {
     width: 100%;
@@ -366,47 +379,75 @@ body.qr-immersive #qrcode.qr-grid-inner {
 }
 
 body.qr-immersive .qr-grid-inner.qr-grid-row {
-    width: 100vw;
-    height: 100vh;
+    width: 100%;
+    height: 100%;
     max-height: none;
-    gap: 0;
+    gap: 28px;
+    padding: 12px 16px;
+    box-sizing: border-box;
     grid-template-columns: 1fr 1fr;
+    background: #fff;
 }
 
 body.qr-immersive .qr-grid-inner.qr-grid-row .qr-grid-cell {
-    width: 50vw;
-    height: 100vh;
+    width: auto;
+    height: 100%;
     max-height: none;
 }
 
 body.qr-immersive .qr-grid-inner.qr-grid-row .qr-grid-cell canvas {
-    width: min(50vw, 100vh);
-    height: min(50vw, 100vh);
-    max-width: 50vw;
-    max-height: 100vh;
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 100%;
     object-fit: contain;
 }
 
+/* 下方：独立一行紧凑控件条，不盖住二维码 */
 body.qr-immersive .qr-stage-hud {
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    padding: 10px 16px 14px;
-    background: linear-gradient(transparent, rgba(0, 0, 0, 0.72));
-    color: #fff;
+    position: static;
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 6px 10px;
+    padding: 6px 10px 8px;
+    background: #161616;
+    color: #eee;
     z-index: 2;
     opacity: 1;
     pointer-events: auto;
+    border-top: 1px solid rgba(255, 255, 255, 0.12);
 }
 
-body.qr-immersive .qr-stage-actions {
+body.qr-immersive .qr-stage-hud .qr-info {
     display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: center;
+    gap: 6px 8px;
+    margin: 0;
 }
 
-body.qr-immersive .qr-counter,
-body.qr-immersive .qr-hint {
+body.qr-immersive .qr-counter {
+    font-size: 13px;
+    font-weight: 600;
+    margin: 0;
     color: #fff;
+    line-height: 1.2;
+}
+
+body.qr-immersive .qr-hint {
+    display: none;
+}
+
+body.qr-immersive .qr-type {
+    padding: 2px 8px;
+    font-size: 10px;
+    border-radius: 10px;
 }
 
 body.qr-immersive .qr-type.data {
@@ -421,9 +462,49 @@ body.qr-immersive .qr-type.filename {
     border-color: rgba(255, 255, 255, 0.35);
 }
 
+body.qr-immersive .chunks-jump-row {
+    gap: 4px 6px;
+    font-size: 11px;
+    margin: 0;
+    color: #ddd;
+}
+
+body.qr-immersive .chunks-jump-row input {
+    width: min(160px, 28vw);
+    padding: 3px 6px;
+    font-size: 12px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.28);
+    color: #fff;
+}
+
+body.qr-immersive .chunks-jump-btn {
+    padding: 3px 8px;
+    font-size: 11px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.28);
+    color: #fff;
+}
+
+body.qr-immersive .chunks-jump-status {
+    font-size: 11px;
+    opacity: 0.85;
+}
+
+body.qr-immersive .qr-stage-actions {
+    display: flex;
+    gap: 4px;
+    margin: 0;
+}
+
 body.qr-immersive .qr-stage-hud .qr-nav-btn {
-    background: rgba(255, 255, 255, 0.15);
-    border-color: rgba(255, 255, 255, 0.35);
+    padding: 4px 10px;
+    font-size: 12px;
+    border-radius: 6px;
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.28);
     color: #fff;
 }
 
@@ -502,23 +583,6 @@ body.qr-immersive .qr-stage-hud .qr-nav-btn {
     outline: 4px solid #00d4ff;
     outline-offset: -4px;
     z-index: 1;
-}
-
-body.qr-immersive .chunks-jump-row {
-    color: #fff;
-    pointer-events: auto;
-}
-
-body.qr-immersive .chunks-jump-row input {
-    background: rgba(255, 255, 255, 0.18);
-    border-color: rgba(255, 255, 255, 0.4);
-    color: #fff;
-}
-
-body.qr-immersive .chunks-jump-btn {
-    background: rgba(255, 255, 255, 0.15);
-    border-color: rgba(255, 255, 255, 0.35);
-    color: #fff;
 }
 
 body.qr-immersive .qr-grid-cell.qr-target {
