@@ -172,13 +172,22 @@
 
 .qr-nav-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
-.qr-display { display: flex; flex-direction: column; align-items: center; gap: 24px; }
+.qr-display { display: flex; flex-direction: column; align-items: center; gap: 24px; width: 100%; }
+
+.qr-stage {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+}
 
 .qr-code-block {
     display: flex;
     flex-direction: column;
     align-items: center;
     gap: 12px;
+    width: 100%;
 }
 
 .qr-container {
@@ -188,6 +197,7 @@
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
     transition: all 0.3s ease;
     border: 2px solid transparent;
+    box-sizing: border-box;
 }
 
 .qr-container.data-qr     { border-color: var(--accent);   box-shadow: 0 8px 32px rgba(0, 212, 255, 0.2); }
@@ -239,6 +249,21 @@
     margin: 0 auto;
 }
 
+.qr-stage-hud {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    width: 100%;
+}
+
+.qr-stage-actions {
+    display: none;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: center;
+}
+
 .qr-info { text-align: center; }
 
 .qr-counter { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
@@ -257,6 +282,207 @@
 .qr-type.filename { background: rgba(255, 159, 28, 0.15); color: var(--warning); border: 1px solid rgba(255, 159, 28, 0.3); }
 
 .qr-hint { margin-top: 12px; font-size: 14px; color: var(--text-secondary); }
+
+/* ===== 整屏沉浸（双码：码区独占上方，控件在底栏，不盖码） ===== */
+body.qr-immersive {
+    overflow: hidden;
+}
+
+body.qr-immersive nav {
+    display: none !important;
+}
+
+body.qr-immersive .container > :not(.qr-section),
+body.qr-immersive .qr-section > .card-title,
+body.qr-immersive .qr-section > .toggle-section,
+body.qr-immersive .qr-section > .qr-controls,
+body.qr-immersive .qr-section > .download-section {
+    display: none !important;
+}
+
+body.qr-immersive .container {
+    max-width: none;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+}
+
+body.qr-immersive .qr-section {
+    position: fixed;
+    inset: 0;
+    z-index: 9999;
+    margin: 0;
+    padding: 0;
+    max-width: none;
+    width: 100vw;
+    height: 100vh;
+    border: none;
+    border-radius: 0;
+    background: #111;
+    display: block !important;
+    box-shadow: none;
+}
+
+body.qr-immersive .qr-display,
+body.qr-immersive .qr-stage {
+    width: 100%;
+    height: 100%;
+    gap: 0;
+}
+
+body.qr-immersive .qr-stage {
+    display: flex;
+    flex-direction: column;
+    background: #111;
+}
+
+body.qr-immersive .qr-code-block {
+    flex: 1 1 auto;
+    min-height: 0;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #fff;
+}
+
+body.qr-immersive .qr-container,
+body.qr-immersive .qr-container.dual-page {
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    max-height: none;
+    border: none !important;
+    box-shadow: none !important;
+    border-radius: 0;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #fff;
+}
+
+body.qr-immersive .qr-dual-grid {
+    width: 100%;
+    height: 100%;
+    gap: 40px;
+    padding: 40px 48px;
+    box-sizing: border-box;
+    grid-template-columns: 1fr 1fr;
+    align-items: stretch;
+    background: #fff;
+}
+
+body.qr-immersive .qr-dual-grid .qr-cell {
+    width: auto;
+    height: 100%;
+    max-height: none;
+    padding: 16px;
+    box-sizing: border-box;
+    background: #fff;
+}
+
+body.qr-immersive .qr-dual-grid .qr-cell canvas,
+body.qr-immersive .qr-dual-grid .qr-cell img {
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+}
+
+body.qr-immersive .qr-container.single-fn .qr-cell {
+    max-width: min(80vw, calc(100vh - 180px));
+    max-height: min(80vw, calc(100vh - 180px));
+    width: 100%;
+    height: 100%;
+    margin: 0 auto;
+}
+
+body.qr-immersive .qr-container.single-fn .qr-cell canvas,
+body.qr-immersive .qr-container.single-fn .qr-cell img {
+    max-width: 100%;
+    max-height: 100%;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+}
+
+body.qr-immersive .qr-stage-hud {
+    flex: 0 0 auto;
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px 16px;
+    padding: 10px 16px 14px;
+    background: linear-gradient(transparent, rgba(0, 0, 0, 0.72));
+    color: #fff;
+    z-index: 2;
+}
+
+body.qr-immersive .qr-stage-hud .qr-info {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    text-align: left;
+}
+
+body.qr-immersive .qr-counter {
+    font-size: 14px;
+    margin: 0;
+    color: #fff;
+}
+
+body.qr-immersive .qr-hint {
+    margin: 0;
+    font-size: 12px;
+    color: rgba(255, 255, 255, 0.75);
+}
+
+body.qr-immersive .qr-type.data,
+body.qr-immersive .qr-type.filename {
+    color: #fff;
+    border-color: rgba(255, 255, 255, 0.35);
+    background: rgba(255, 255, 255, 0.1);
+}
+
+body.qr-immersive .chunks-jump-row {
+    color: #fff;
+}
+
+body.qr-immersive .chunks-jump-row input {
+    background: rgba(255, 255, 255, 0.18);
+    border-color: rgba(255, 255, 255, 0.4);
+    color: #fff;
+}
+
+body.qr-immersive .chunks-jump-btn {
+    background: rgba(255, 255, 255, 0.15);
+    border-color: rgba(255, 255, 255, 0.35);
+    color: #fff;
+}
+
+body.qr-immersive .qr-stage-actions {
+    display: flex;
+}
+
+body.qr-immersive .qr-stage-hud .qr-nav-btn {
+    padding: 4px 10px;
+    font-size: 12px;
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.3);
+    color: #fff;
+}
+
+body.qr-immersive .qr-cell.highlight {
+    border-color: #ff9f1c;
+    box-shadow: 0 0 0 2px rgba(255, 159, 28, 0.35);
+}
 
 /* ===== Toggle Section ===== */
 .toggle-section {

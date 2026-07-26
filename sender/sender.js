@@ -245,8 +245,8 @@ async function generateQRCodeSequence() {
 
     generateBtn.disabled = false;
     generateBtn.innerHTML = '<span>生成二维码</span>';
-    showToast('二维码生成完成');
-    qrSection.scrollIntoView({ behavior: 'smooth' });
+    showToast('二维码生成完成（左奇数 / 右偶数）；已进入整屏，Esc 退出');
+    enterQrImmersive();
 }
 
 /** 数据页数 + 1（文件名页） */
@@ -360,15 +360,18 @@ function showQRPage(pageIndex) {
 }
 
 // ===== 导航（按页） =====
-document.getElementById('prevBtn').addEventListener('click', () => {
+function goPrevPage() {
     stopAutoplay();
     if (currentPageIndex > 0) showQRPage(currentPageIndex - 1);
-});
+}
 
-document.getElementById('nextBtn').addEventListener('click', () => {
+function goNextPage() {
     stopAutoplay();
     if (currentPageIndex < getTotalPages() - 1) showQRPage(currentPageIndex + 1);
-});
+}
+
+document.getElementById('prevBtn').addEventListener('click', goPrevPage);
+document.getElementById('nextBtn').addEventListener('click', goNextPage);
 
 // ===== 自动播放 =====
 const playBtn       = document.getElementById('playBtn');
@@ -377,6 +380,15 @@ const autoplayStatus = document.getElementById('autoplayStatus');
 
 playBtn.addEventListener('click', () => isPlaying ? stopAutoplay() : startAutoplay());
 autoplayToggle.addEventListener('change', () => autoplayToggle.checked ? startAutoplay() : stopAutoplay());
+
+function syncPlayButtons() {
+    const label = isPlaying ? '⏸ 暂停' : '▶ 播放';
+    playBtn.textContent = label;
+    const stagePlay = document.getElementById('stagePlayBtn');
+    if (stagePlay) stagePlay.textContent = isPlaying ? '⏸' : '▶';
+    const fsBtn = document.getElementById('fullscreenBtn');
+    if (fsBtn) fsBtn.textContent = qrImmersive ? '⛶ 退出整屏' : '⛶ 整屏展示';
+}
 
 function clearAutoplayTimer() {
     if (autoplayTimer !== null) {
@@ -399,24 +411,104 @@ function scheduleNextAutoplay() {
 function startAutoplay() {
     if (!qrCodes.length) return;
     isPlaying = true;
-    playBtn.textContent = '⏸ 暂停';
     autoplayToggle.checked = true;
     autoplayStatus.textContent = '开启';
+    syncPlayButtons();
     scheduleNextAutoplay();
 }
 
 function stopAutoplay() {
     isPlaying = false;
-    playBtn.textContent = '▶ 播放';
     autoplayToggle.checked = false;
     autoplayStatus.textContent = '关闭';
     clearAutoplayTimer();
+    syncPlayButtons();
 }
 
 function restartAutoplay() {
     if (!isPlaying) return;
     scheduleNextAutoplay();
 }
+
+// ===== 整屏沉浸（浏览器全屏 + 双码铺满） =====
+let qrImmersive = false;
+
+async function enterQrImmersive() {
+    if (!qrCodes.length) return;
+    qrImmersive = true;
+    document.body.classList.add('qr-immersive');
+    syncPlayButtons();
+    const stage = document.getElementById('qrStage');
+    try {
+        const req = stage && (stage.requestFullscreen || stage.webkitRequestFullscreen);
+        if (req && !document.fullscreenElement) {
+            await Promise.resolve(req.call(stage)).catch(() => {});
+        }
+    } catch (_) {}
+}
+
+async function exitQrImmersive() {
+    qrImmersive = false;
+    document.body.classList.remove('qr-immersive');
+    syncPlayButtons();
+    try {
+        if (document.fullscreenElement && document.exitFullscreen) {
+            await document.exitFullscreen().catch(() => {});
+        } else if (document.webkitFullscreenElement && document.webkitExitFullscreen) {
+            await Promise.resolve(document.webkitExitFullscreen()).catch(() => {});
+        }
+    } catch (_) {}
+}
+
+function toggleQrImmersive() {
+    if (qrImmersive) exitQrImmersive();
+    else enterQrImmersive();
+}
+
+document.getElementById('fullscreenBtn').addEventListener('click', toggleQrImmersive);
+document.getElementById('exitFullscreenBtn').addEventListener('click', exitQrImmersive);
+document.getElementById('stagePrevBtn').addEventListener('click', goPrevPage);
+document.getElementById('stageNextBtn').addEventListener('click', goNextPage);
+document.getElementById('stagePlayBtn').addEventListener('click', () => {
+    isPlaying ? stopAutoplay() : startAutoplay();
+});
+
+document.addEventListener('keydown', (e) => {
+    const tag = (e.target && e.target.tagName) || '';
+    const typing = tag === 'INPUT' || tag === 'TEXTAREA';
+    if (e.key === 'Escape' && qrImmersive) {
+        e.preventDefault();
+        exitQrImmersive();
+        return;
+    }
+    if (typing || !qrCodes.length) return;
+    if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        goPrevPage();
+    } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        goNextPage();
+    } else if (e.key === ' ') {
+        e.preventDefault();
+        isPlaying ? stopAutoplay() : startAutoplay();
+    }
+});
+
+document.addEventListener('fullscreenchange', () => {
+    if (!document.fullscreenElement && qrImmersive) {
+        // 用户用系统 Esc 退出浏览器全屏时，同步退出沉浸样式
+        qrImmersive = false;
+        document.body.classList.remove('qr-immersive');
+        syncPlayButtons();
+    }
+});
+document.addEventListener('webkitfullscreenchange', () => {
+    if (!document.webkitFullscreenElement && qrImmersive) {
+        qrImmersive = false;
+        document.body.classList.remove('qr-immersive');
+        syncPlayButtons();
+    }
+});
 
 // ===== 下载 =====
 document.getElementById('downloadCurrentBtn').addEventListener('click', () => {
@@ -503,6 +595,7 @@ document.getElementById('downloadAllBtn').addEventListener('click', async () => 
 // ===== 重置 =====
 resetBtn.addEventListener('click', () => {
     stopAutoplay();
+    exitQrImmersive();
     file = null; chunks = []; qrCodes = []; currentPageIndex = 0; highlightSide = null;
     fileFingerprint = ''; originalFileName = ''; originalFileSize = 0;
     fileNameQrCode = null; hasGenerated = false;

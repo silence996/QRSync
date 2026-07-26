@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>QRSync - 发送端</title>
     <link rel="stylesheet" href="../shared/theme.css">
-    <link rel="stylesheet" href="sender.css?v=20260726-dual1">
+    <link rel="stylesheet" href="sender.css?v=20260726-dual-fs1">
 </head>
 <body>
     <nav>
@@ -138,23 +138,34 @@
                 <button class="qr-nav-btn" id="prevBtn">← 上一页</button>
                 <button class="qr-nav-btn" id="playBtn">▶ 播放</button>
                 <button class="qr-nav-btn" id="nextBtn">下一页 →</button>
+                <button class="qr-nav-btn" id="fullscreenBtn" type="button">⛶ 整屏展示</button>
             </div>
 
-            <div class="qr-display">
-                <div class="qr-code-block">
-                    <div class="qr-container data-qr" id="qrContainer">
-                        <div id="qrcode"></div>
+            <div class="qr-display" id="qrDisplay">
+                <div class="qr-stage" id="qrStage">
+                    <div class="qr-code-block">
+                        <div class="qr-container data-qr" id="qrContainer">
+                            <div id="qrcode"></div>
+                        </div>
                     </div>
-                    <div class="chunks-jump-row" id="chunkJumpRow">
-                        <span>跳转到数据分片</span>
-                        <input type="number" id="chunkJumpInput" min="1" max="1" value="1">
-                        <button type="button" class="chunks-jump-btn" id="chunkJumpBtn">确定</button>
+                    <div class="qr-stage-hud" id="qrStageHud">
+                        <div class="qr-info">
+                            <div class="qr-counter" id="qrCounter">1 / 10</div>
+                            <span class="qr-type data" id="qrType">数据分片</span>
+                            <div class="qr-hint" id="qrHint">请使用接收端扫描此二维码</div>
+                        </div>
+                        <div class="chunks-jump-row" id="chunkJumpRow">
+                            <span>跳转到数据分片</span>
+                            <input type="number" id="chunkJumpInput" min="1" max="1" value="1">
+                            <button type="button" class="chunks-jump-btn" id="chunkJumpBtn">确定</button>
+                        </div>
+                        <div class="qr-stage-actions">
+                            <button type="button" class="qr-nav-btn" id="stagePrevBtn">←</button>
+                            <button type="button" class="qr-nav-btn" id="stagePlayBtn">▶</button>
+                            <button type="button" class="qr-nav-btn" id="stageNextBtn">→</button>
+                            <button type="button" class="qr-nav-btn" id="exitFullscreenBtn">退出整屏 (Esc)</button>
+                        </div>
                     </div>
-                </div>
-                <div class="qr-info">
-                    <div class="qr-counter" id="qrCounter">1 / 10</div>
-                    <span class="qr-type data" id="qrType">数据分片</span>
-                    <div class="qr-hint" id="qrHint">请使用接收端扫描此二维码</div>
                 </div>
             </div>
 
@@ -180,6 +191,6 @@
     <!-- 共享工具函数 -->
     <script src="../shared/utils.js"></script>
     <!-- 发送端逻辑 -->
-    <script src="sender.js?v=20260726-dual1"></script>
+    <script src="sender.js?v=20260726-dual-fs1"></script>
 </body>
 </html>
