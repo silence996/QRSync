@@ -15,9 +15,9 @@ let lastFrameTime = 0;
 let lastDecodedText = '';
 let lastScanTime = 0;
 
-// 相机裁剪 canvas（复用，避免频繁分配）
-let cropCanvas = null;
-let cropCtx = null;
+// 全幅取景 canvas（复用）
+let frameCanvas = null;
+let frameCtx = null;
 
 // 连播：默认关 rotate/invert 以提速；连续未识别再升级（不影响 tryHarder）
 let zxingMissStreak = 0;
@@ -29,7 +29,201 @@ let currentImageIndex = -1;
 
 const SCAN_FPS = 12;
 
+/** 同帧左右半幅并行：固定 2 个 Worker（非历史帧队列） */
+const DECODE_WORKER_COUNT = 2;
+/** 左右半幅中线重叠比例，避免 quiet zone 被切掉 */
+const HALF_OVERLAP_RATIO = 0.04;
+
 const DB = localforage.createInstance({ name: 'qrcode-receiver-v2' });
+
+// ===== Decode Worker 池（同帧左/右各一路） =====
+let decodeWorkers = [];
+let idleWorkers = [];
+let decodeWorkerReady = false;
+let decodeReqId = 0;
+const pendingDecodes = new Map();
+let decodeWorkerScriptUrl = null;
+let decodeWorkerScriptPromise = null;
+let wasmBinaryCopies = null;
+
+function loadScriptOnce(src) {
+    return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        s.src = src;
+        s.onload = () => resolve();
+        s.onerror = () => reject(new Error('脚本加载失败: ' + src));
+        document.head.appendChild(s);
+    });
+}
+
+/**
+ * file:// 无法直接 Worker(本地脚本)；用预生成 decode-worker-source.js + Blob。
+ * http(s) 仍用 decode-worker.js + importScripts。
+ */
+async function ensureDecodeWorkerScriptUrl() {
+    if (decodeWorkerScriptUrl) return decodeWorkerScriptUrl;
+    if (decodeWorkerScriptPromise) return decodeWorkerScriptPromise;
+
+    decodeWorkerScriptPromise = (async () => {
+        if (location.protocol !== 'file:') {
+            decodeWorkerScriptUrl = 'decode-worker.js';
+            return decodeWorkerScriptUrl;
+        }
+        if (!window.__QRSyncDecodeWorkerSource) {
+            await loadScriptOnce('decode-worker-source.js?v=20260726-dual1');
+        }
+        const source = window.__QRSyncDecodeWorkerSource;
+        if (!source || typeof source !== 'string') {
+            throw new Error(
+                '缺少 __QRSyncDecodeWorkerSource。请确认存在 receiver/decode-worker-source.js，' +
+                '或运行 tools/build-decode-worker-source.ps1 重新生成'
+            );
+        }
+        const blob = new Blob([source], { type: 'application/javascript' });
+        decodeWorkerScriptUrl = URL.createObjectURL(blob);
+        return decodeWorkerScriptUrl;
+    })();
+
+    try {
+        return await decodeWorkerScriptPromise;
+    } catch (err) {
+        decodeWorkerScriptPromise = null;
+        throw err;
+    }
+}
+
+function createDecodeWorker(wasmBinary) {
+    return new Promise((resolve) => {
+        let settled = false;
+        const finish = (ok, worker) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(ok ? worker : null);
+        };
+        const timer = setTimeout(() => finish(false, null), 20000);
+
+        ensureDecodeWorkerScriptUrl()
+            .then((scriptUrl) => {
+                let worker;
+                try {
+                    worker = new Worker(scriptUrl);
+                } catch (err) {
+                    console.warn('[decode-worker] 创建失败:', err.message);
+                    finish(false, null);
+                    return;
+                }
+
+                worker.onmessage = (event) => {
+                    const msg = event.data;
+                    if (!msg) return;
+                    if (msg.type === 'ready') {
+                        finish(true, worker);
+                        return;
+                    }
+                    if (msg.type === 'result') {
+                        const pending = pendingDecodes.get(msg.id);
+                        if (!pending) return;
+                        pendingDecodes.delete(msg.id);
+                        idleWorkers.push(worker);
+                        pending.resolve(msg.text || null);
+                    }
+                };
+                worker.onerror = (err) => {
+                    console.warn('[decode-worker] 错误:', err.message || err);
+                    finish(false, null);
+                };
+
+                worker.postMessage({ type: 'init', wasmBinary }, [wasmBinary]);
+            })
+            .catch((err) => {
+                console.warn('[decode-worker] 脚本准备失败:', err.message);
+                finish(false, null);
+            });
+    });
+}
+
+async function initDecodeWorker() {
+    if (decodeWorkerReady && decodeWorkers.length > 0) return true;
+
+    if (!wasmBinaryCopies) {
+        wasmBinaryCopies = window.__QRSyncWasmBinaryCopies || null;
+        window.__QRSyncWasmBinaryCopies = null;
+    }
+    const copies = wasmBinaryCopies;
+
+    if (typeof Worker === 'undefined') {
+        console.warn('[decode-worker] ⚠️ 环境不支持 Worker，回退主线程');
+        return false;
+    }
+    if (!copies || !copies.length) {
+        console.warn('[decode-worker] ⚠️ 无 wasm 副本，回退主线程（请硬刷新页面）');
+        return false;
+    }
+
+    const count = Math.min(DECODE_WORKER_COUNT, copies.length);
+    const workers = await Promise.all(
+        copies.slice(0, count).map((buf) => createDecodeWorker(buf))
+    );
+    wasmBinaryCopies = copies.length > count ? copies.slice(count) : null;
+
+    decodeWorkers = workers.filter(Boolean);
+    idleWorkers = decodeWorkers.slice();
+    decodeWorkerReady = decodeWorkers.length > 0;
+    if (!decodeWorkerReady) {
+        console.warn('[decode-worker] ⚠️ 全部失败，回退主线程解码');
+    } else {
+        console.log(`[decode-worker] ✅ 已就绪 ${decodeWorkers.length} 路（同帧左右并行）`);
+    }
+    return decodeWorkerReady;
+}
+
+function decodeOnWorker(imgData, options) {
+    const id = ++decodeReqId;
+    const copy = imgData.data.slice();
+    const buffer = copy.buffer;
+
+    return new Promise((resolve) => {
+        const send = (worker) => {
+            pendingDecodes.set(id, { resolve });
+            try {
+                worker.postMessage({
+                    type: 'decode',
+                    id,
+                    width: imgData.width,
+                    height: imgData.height,
+                    buffer,
+                    options
+                }, [buffer]);
+            } catch (_) {
+                pendingDecodes.delete(id);
+                idleWorkers.push(worker);
+                resolve(null);
+            }
+        };
+
+        const worker = idleWorkers.pop();
+        if (worker) {
+            send(worker);
+            return;
+        }
+
+        const start = performance.now();
+        const wait = () => {
+            const w = idleWorkers.pop();
+            if (w) {
+                send(w);
+                return;
+            }
+            if (performance.now() - start > 2000) {
+                resolve(null);
+                return;
+            }
+            setTimeout(wait, 8);
+        };
+        wait();
+    });
+}
 
 // ===== 分辨率档位 =====
 const RESOLUTION_PRESETS = {
@@ -63,9 +257,8 @@ function noteDecodeResult(ok) {
     else zxingMissStreak++;
 }
 
-// ===== 统一解码函数 =====
-// 接受 ImageData，优先用 zxing-wasm（C++ 级别），失败后用 jsQR 兜底
-async function decodeImageData(imgData, { forceHard = false } = {}) {
+/** 主线程单幅解码（Worker 不可用或虚拟模式兜底） */
+async function decodeImageDataMain(imgData, { forceHard = false } = {}) {
     let text = null;
     if (typeof ZXingWASM !== 'undefined' && ZXingWASM._wasmReady) {
         try {
@@ -76,15 +269,57 @@ async function decodeImageData(imgData, { forceHard = false } = {}) {
             if (results.length > 0) text = results[0].text;
         } catch (_) {}
     }
-    // jsQR 后备：仅在 hard 或已连续 miss 时使用，避免每帧双解码拖慢
     if (!text && (forceHard || zxingMissStreak >= ZXING_HARD_AFTER_MISS)) {
         const r = jsQR(imgData.data, imgData.width, imgData.height, {
             inversionAttempts: forceHard ? 'attemptBoth' : 'dontInvert'
         });
         text = r ? r.data : null;
     }
+    return text;
+}
+
+/** 对外单幅接口：优先 Worker，否则主线程 */
+async function decodeImageData(imgData, { forceHard = false } = {}) {
+    const options = getZXingOptions(forceHard);
+    let text = null;
+    if (decodeWorkerReady) {
+        try {
+            text = await decodeOnWorker(imgData, options);
+        } catch (_) {}
+    }
+    if (!text) text = await decodeImageDataMain(imgData, { forceHard });
     noteDecodeResult(!!text);
     return text;
+}
+
+/**
+ * 同帧左右半幅并行解码：
+ * - Worker A ← 左半幅（奇数码）
+ * - Worker B ← 右半幅（偶数码）
+ * 不是并行解码历史帧队列。
+ */
+async function decodeDualHalves(left, right, { forceHard = false } = {}) {
+    const options = getZXingOptions(forceHard);
+    let leftText = null;
+    let rightText = null;
+
+    if (decodeWorkerReady && decodeWorkers.length >= 2) {
+        [leftText, rightText] = await Promise.all([
+            decodeOnWorker(left, options),
+            decodeOnWorker(right, options)
+        ]);
+    } else if (decodeWorkerReady && decodeWorkers.length === 1) {
+        leftText = await decodeOnWorker(left, options);
+        rightText = await decodeOnWorker(right, options);
+    } else {
+        [leftText, rightText] = await Promise.all([
+            decodeImageDataMain(left, { forceHard }),
+            decodeImageDataMain(right, { forceHard })
+        ]);
+    }
+
+    const hit = !!(leftText || rightText);
+    return { leftText, rightText, hit };
 }
 
 // ===== 相机模式 =====
@@ -119,26 +354,43 @@ function formatResolutionLabel(actual) {
     return `${actual.width}×${actual.height} ${tag}`;
 }
 
-// 从视频帧裁出中心正方形的 ImageData（1:1，不降采样），与 CSS object-fit:cover 一致
-function captureFrame(video) {
+/** 全幅取景（不中心裁方、不降采样），适配横向双码 */
+function captureFullFrame(video) {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
-    const size = Math.min(vw, vh);
-    const sx = Math.round((vw - size) / 2);
-    const sy = Math.round((vh - size) / 2);
+    if (!vw || !vh) return null;
 
-    if (!cropCanvas) {
-        cropCanvas = document.createElement('canvas');
-        cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
+    if (!frameCanvas) {
+        frameCanvas = document.createElement('canvas');
+        frameCtx = frameCanvas.getContext('2d', { willReadFrequently: true });
     }
-    if (cropCanvas.width !== size || cropCanvas.height !== size) {
-        cropCanvas.width = size;
-        cropCanvas.height = size;
+    if (frameCanvas.width !== vw || frameCanvas.height !== vh) {
+        frameCanvas.width = vw;
+        frameCanvas.height = vh;
     }
-    // 无缩放，关闭平滑避免无关插值开销
-    cropCtx.imageSmoothingEnabled = false;
-    cropCtx.drawImage(video, sx, sy, size, size, 0, 0, size, size);
-    return cropCtx.getImageData(0, 0, size, size);
+    frameCtx.imageSmoothingEnabled = false;
+    frameCtx.drawImage(video, 0, 0, vw, vh);
+    return frameCtx.getImageData(0, 0, vw, vh);
+}
+
+/** 切左右半幅；中线略重叠，避免 quiet zone 被切断 */
+function splitFrameHalves(imgData) {
+    const { width, height, data } = imgData;
+    const overlap = Math.max(2, Math.round(width * HALF_OVERLAP_RATIO));
+    const mid = Math.floor(width / 2);
+    const leftW = Math.min(width, mid + overlap);
+    const rightX = Math.max(0, mid - overlap);
+    const rightW = width - rightX;
+
+    const left = new ImageData(leftW, height);
+    const right = new ImageData(rightW, height);
+
+    for (let y = 0; y < height; y++) {
+        const row = y * width * 4;
+        left.data.set(data.subarray(row, row + leftW * 4), y * leftW * 4);
+        right.data.set(data.subarray(row + rightX * 4, row + (rightX + rightW) * 4), y * rightW * 4);
+    }
+    return { left, right };
 }
 
 function startScanLoop(video) {
@@ -155,9 +407,26 @@ function startScanLoop(video) {
 
         try {
             if (!video.videoWidth || !video.videoHeight) return;
-            const imgData = captureFrame(video);
-            const text = await decodeImageData(imgData);
-            if (text) handleScanResult(text);
+            const full = captureFullFrame(video);
+            if (!full) return;
+            const { left, right } = splitFrameHalves(full);
+            const { leftText, rightText, hit } = await decodeDualHalves(left, right);
+            // 两路结果都处理（不同分片）；同文去抖在 handleScanResult
+            if (leftText) handleScanResult(leftText);
+            if (rightText) handleScanResult(rightText);
+            // 文件名单页居中时左右切开会失败 → 全幅兜底
+            if (!hit) {
+                const options = getZXingOptions(false);
+                let text = null;
+                if (decodeWorkerReady) {
+                    try { text = await decodeOnWorker(full, options); } catch (_) {}
+                }
+                if (!text) text = await decodeImageDataMain(full, { forceHard: false });
+                if (text) handleScanResult(text);
+                noteDecodeResult(!!text);
+            } else {
+                noteDecodeResult(true);
+            }
         } catch (_) {
         } finally {
             decoding = false;
@@ -172,8 +441,8 @@ function stopScanLoop() {
         cancelAnimationFrame(scanRafId);
         scanRafId = null;
     }
-    cropCanvas = null;
-    cropCtx = null;
+    frameCanvas = null;
+    frameCtx = null;
     zxingMissStreak = 0;
 }
 
@@ -220,6 +489,10 @@ async function startCamera() {
         document.getElementById('btn-start').disabled = true;
         document.getElementById('scan-btn-text').textContent = '⏳ 启动中...';
         document.getElementById('resolution-actual').textContent = '';
+
+        if (!decodeWorkerReady) {
+            await initDecodeWorker();
+        }
 
         const { stream, actual } = await tryOpenStream(deviceId || null, candidates);
 
@@ -646,6 +919,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (isMod && e.key === 'v') return; // 让 paste 事件处理
     });
 
+    await initDecodeWorker();
     await initCameraList();
     await loadProgress();
     showCameraStatus('等待扫描第一个二维码...', 'info');

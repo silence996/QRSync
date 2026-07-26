@@ -10,7 +10,10 @@ const CONFIG = {
 // ===== 状态 =====
 let file = null;
 let chunks = [];
-let currentChunkIndex = 0;
+/** 按页导航：每页最多 2 个数据码（左奇右偶），文件名单独一页 */
+let currentPageIndex = 0;
+/** 跳转到分片时高亮左/右半幅：'left' | 'right' | null */
+let highlightSide = null;
 let fileFingerprint = '';
 let originalFileName = '';
 let originalFileSize = 0;
@@ -227,7 +230,8 @@ function createFileNameQrCode(totalChunks) {
 
 async function generateQRCodeSequence() {
     qrSection.classList.add('show');
-    currentChunkIndex = 0;
+    currentPageIndex = 0;
+    highlightSide = null;
     qrCodes = chunks.map((c, i) => ({ data: c, type: CONFIG.PACKET_TYPES.DATA, index: i }));
     qrCodes.push({ data: fileNameQrCode, type: CONFIG.PACKET_TYPES.FILENAME, index: chunks.length });
 
@@ -236,8 +240,8 @@ async function generateQRCodeSequence() {
     document.getElementById('dataQrCount').textContent = chunks.length;
     downloadSection.classList.add('show');
 
-    updateJumpControls(0);
-    showQRCode(0);
+    updateJumpControls(null);
+    showQRPage(0);
 
     generateBtn.disabled = false;
     generateBtn.innerHTML = '<span>生成二维码</span>';
@@ -245,19 +249,46 @@ async function generateQRCodeSequence() {
     qrSection.scrollIntoView({ behavior: 'smooth' });
 }
 
-function updateJumpControls(index) {
-    const total = qrCodes.length;
-    chunkJumpInput.max = String(Math.max(total, 1));
-    chunkJumpInput.value = String(index + 1);
+/** 数据页数 + 1（文件名页） */
+function getTotalPages() {
+    if (!chunks.length) return qrCodes.length ? 1 : 0;
+    return Math.ceil(chunks.length / 2) + 1;
+}
+
+function isFilenamePage(pageIndex) {
+    return chunks.length > 0 && pageIndex === Math.ceil(chunks.length / 2);
+}
+
+/** 1-based 数据分片号 → 页与左右 */
+function chunkNumberToPage(chunkNum1Based) {
+    const idx = chunkNum1Based - 1;
+    return {
+        pageIndex: Math.floor(idx / 2),
+        side: (idx % 2 === 0) ? 'left' : 'right'
+    };
+}
+
+function updateJumpControls(focusChunk1Based) {
+    const maxJump = chunks.length > 0 ? chunks.length : Math.max(qrCodes.length, 1);
+    chunkJumpInput.max = String(maxJump);
+    if (focusChunk1Based != null) {
+        chunkJumpInput.value = String(focusChunk1Based);
+    } else if (isFilenamePage(currentPageIndex)) {
+        chunkJumpInput.value = String(chunks.length || 1);
+    } else {
+        const leftIdx = currentPageIndex * 2;
+        chunkJumpInput.value = String(leftIdx + 1);
+    }
 }
 
 function jumpToChunk() {
-    const total = qrCodes.length;
-    if (!total) return;
+    if (!qrCodes.length) return;
     const raw = parseInt(chunkJumpInput.value, 10);
-    if (isNaN(raw) || raw < 1 || raw > total) return;
+    if (isNaN(raw) || raw < 1 || raw > chunks.length) return;
     stopAutoplay();
-    showQRCode(raw - 1);
+    const { pageIndex, side } = chunkNumberToPage(raw);
+    highlightSide = side;
+    showQRPage(pageIndex);
 }
 
 chunkJumpBtn.addEventListener('click', jumpToChunk);
@@ -265,49 +296,78 @@ chunkJumpInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') jumpToChunk();
 });
 
-function showQRCode(index) {
-    currentChunkIndex = index;
-    const qrData = qrCodes[index];
-    const isFilename = qrData.type === CONFIG.PACKET_TYPES.FILENAME;
-
-    qrContainer.className = isFilename ? 'qr-container filename-qr' : 'qr-container data-qr';
-
-    let qrEl = document.getElementById('qrcode');
-    if (!qrEl) {
-        qrContainer.innerHTML = '<div id="qrcode"></div>';
-        qrEl = document.getElementById('qrcode');
-    } else {
-        qrEl.innerHTML = '';
-    }
-
-    new QRCode(qrEl, {
-        text: JSON.stringify(qrData.data),
+function renderSingleQr(el, payload) {
+    el.innerHTML = '';
+    new QRCode(el, {
+        text: JSON.stringify(payload),
         width: CONFIG.QR_SIZE,
         height: CONFIG.QR_SIZE,
         colorDark: '#000000',
         colorLight: '#ffffff',
         correctLevel: QRCode.CorrectLevel.L
     });
-
-    document.getElementById('qrCounter').textContent = `${index + 1} / ${qrCodes.length}`;
-
-    const qrType = document.getElementById('qrType');
-    qrType.textContent = isFilename ? '文件名分片' : `数据分片 ${qrData.data.i + 1}/${qrData.data.t}`;
-    qrType.className = 'qr-type ' + (isFilename ? 'filename' : 'data');
-    document.getElementById('qrHint').textContent = isFilename ? '⚠️ 请最后扫描此二维码' : '请使用接收端扫描此二维码';
-
-    updateJumpControls(index);
 }
 
-// ===== 导航 =====
+function showQRPage(pageIndex) {
+    const totalPages = getTotalPages();
+    if (!totalPages || pageIndex < 0 || pageIndex >= totalPages) return;
+    currentPageIndex = pageIndex;
+
+    const qrType = document.getElementById('qrType');
+    const qrHint = document.getElementById('qrHint');
+    document.getElementById('qrCounter').textContent = `${pageIndex + 1} / ${totalPages}`;
+
+    if (isFilenamePage(pageIndex)) {
+        qrContainer.className = 'qr-container filename-qr dual-page single-fn';
+        qrContainer.innerHTML = '<div class="qr-cell" id="qrcodeFn"></div>';
+        renderSingleQr(document.getElementById('qrcodeFn'), fileNameQrCode);
+        qrType.textContent = '文件名分片';
+        qrType.className = 'qr-type filename';
+        qrHint.textContent = '⚠️ 请最后扫描此二维码';
+        highlightSide = null;
+        updateJumpControls(null);
+        return;
+    }
+
+    const leftIdx = pageIndex * 2;
+    const rightIdx = leftIdx + 1;
+    const left = qrCodes[leftIdx];
+    const right = rightIdx < chunks.length ? qrCodes[rightIdx] : null;
+
+    qrContainer.className = 'qr-container data-qr dual-page';
+    qrContainer.innerHTML = `
+        <div class="qr-dual-grid">
+            <div class="qr-cell${highlightSide === 'left' ? ' highlight' : ''}" id="qrcodeLeft"></div>
+            <div class="qr-cell${highlightSide === 'right' ? ' highlight' : ''}${right ? '' : ' empty'}" id="qrcodeRight"></div>
+        </div>
+    `;
+    renderSingleQr(document.getElementById('qrcodeLeft'), left.data);
+    if (right) {
+        renderSingleQr(document.getElementById('qrcodeRight'), right.data);
+    }
+
+    const leftLabel = left.data.i + 1;
+    const rightLabel = right ? (right.data.i + 1) : null;
+    qrType.textContent = rightLabel
+        ? `左 ${leftLabel} · 右 ${rightLabel} / ${left.data.t}`
+        : `左 ${leftLabel} / ${left.data.t}`;
+    qrType.className = 'qr-type data';
+    qrHint.textContent = '左=奇数分片，右=偶数分片；请对准两个码同时扫描';
+
+    updateJumpControls(highlightSide === 'right' && rightLabel ? rightLabel : leftLabel);
+    // 高亮仅用于跳转提示，下一页翻页时清除
+    highlightSide = null;
+}
+
+// ===== 导航（按页） =====
 document.getElementById('prevBtn').addEventListener('click', () => {
     stopAutoplay();
-    if (currentChunkIndex > 0) showQRCode(currentChunkIndex - 1);
+    if (currentPageIndex > 0) showQRPage(currentPageIndex - 1);
 });
 
 document.getElementById('nextBtn').addEventListener('click', () => {
     stopAutoplay();
-    if (currentChunkIndex < qrCodes.length - 1) showQRCode(currentChunkIndex + 1);
+    if (currentPageIndex < getTotalPages() - 1) showQRPage(currentPageIndex + 1);
 });
 
 // ===== 自动播放 =====
@@ -330,7 +390,8 @@ function scheduleNextAutoplay() {
     autoplayTimer = setTimeout(() => {
         autoplayTimer = null;
         if (!isPlaying || !qrCodes.length) return;
-        showQRCode((currentChunkIndex + 1) % qrCodes.length);
+        const total = getTotalPages();
+        showQRPage((currentPageIndex + 1) % total);
         scheduleNextAutoplay();
     }, CONFIG.AUTOPLAY_INTERVAL);
 }
@@ -359,13 +420,25 @@ function restartAutoplay() {
 
 // ===== 下载 =====
 document.getElementById('downloadCurrentBtn').addEventListener('click', () => {
-    const canvas = qrContainer.querySelector('canvas');
-    if (!canvas) { showToast('没有可下载的二维码'); return; }
-    const isLast = currentChunkIndex === qrCodes.length - 1;
-    const filename = isLast
-        ? `qrcode_${fileFingerprint}_filename.png`
-        : `qrcode_${fileFingerprint}_${String(currentChunkIndex + 1).padStart(3, '0')}.png`;
-    canvas.toBlob(blob => { saveFile(blob, filename); showToast('已开始下载当前二维码'); }, 'image/png');
+    const canvases = qrContainer.querySelectorAll('canvas');
+    if (!canvases.length) { showToast('没有可下载的二维码'); return; }
+
+    if (isFilenamePage(currentPageIndex)) {
+        canvases[0].toBlob(blob => {
+            saveFile(blob, `qrcode_${fileFingerprint}_filename.png`);
+            showToast('已开始下载当前二维码');
+        }, 'image/png');
+        return;
+    }
+
+    const leftIdx = currentPageIndex * 2;
+    canvases.forEach((cvs, i) => {
+        const chunkNum = leftIdx + i + 1;
+        cvs.toBlob(blob => {
+            saveFile(blob, `qrcode_${fileFingerprint}_${String(chunkNum).padStart(3, '0')}.png`);
+        }, 'image/png');
+    });
+    showToast(canvases.length > 1 ? '已开始下载本页两个二维码' : '已开始下载当前二维码');
 });
 
 document.getElementById('downloadAllBtn').addEventListener('click', async () => {
@@ -430,7 +503,7 @@ document.getElementById('downloadAllBtn').addEventListener('click', async () => 
 // ===== 重置 =====
 resetBtn.addEventListener('click', () => {
     stopAutoplay();
-    file = null; chunks = []; qrCodes = []; currentChunkIndex = 0;
+    file = null; chunks = []; qrCodes = []; currentPageIndex = 0; highlightSide = null;
     fileFingerprint = ''; originalFileName = ''; originalFileSize = 0;
     fileNameQrCode = null; hasGenerated = false;
 

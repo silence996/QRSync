@@ -182,7 +182,7 @@
 }
 
 .qr-container {
-    padding: 32px;
+    padding: 24px;
     background: #ffffff;
     border-radius: 24px;
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
@@ -193,7 +193,51 @@
 .qr-container.data-qr     { border-color: var(--accent);   box-shadow: 0 8px 32px rgba(0, 212, 255, 0.2); }
 .qr-container.filename-qr { border-color: var(--warning);  box-shadow: 0 8px 32px rgba(255, 159, 28, 0.2); }
 
-#qrcode img, #qrcode canvas { max-width: 100%; height: auto; display: block; }
+.qr-container.dual-page {
+    /* quiet zone：白底 padding，勿在码上叠 UI */
+    max-width: min(96vw, 1100px);
+}
+
+.qr-dual-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 28px;
+    align-items: center;
+    width: 100%;
+}
+
+.qr-cell {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 0;
+    padding: 8px;
+    border-radius: 8px;
+    border: 2px solid transparent;
+}
+
+.qr-cell.highlight {
+    border-color: rgba(0, 160, 80, 0.85);
+    box-shadow: 0 0 0 2px rgba(0, 160, 80, 0.25);
+}
+
+.qr-cell.empty {
+    visibility: hidden;
+}
+
+.qr-cell img,
+.qr-cell canvas,
+#qrcode img,
+#qrcode canvas {
+    max-width: 100%;
+    height: auto;
+    display: block;
+}
+
+.qr-container.single-fn .qr-cell {
+    max-width: min(70vw, 520px);
+    margin: 0 auto;
+}
 
 .qr-info { text-align: center; }
 

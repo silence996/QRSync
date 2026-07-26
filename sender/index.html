@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>QRSync - 发送端</title>
     <link rel="stylesheet" href="../shared/theme.css">
-    <link rel="stylesheet" href="sender.css">
+    <link rel="stylesheet" href="sender.css?v=20260726-dual1">
 </head>
 <body>
     <nav>
@@ -135,9 +135,9 @@
             </div>
 
             <div class="qr-controls">
-                <button class="qr-nav-btn" id="prevBtn">← 上一个</button>
+                <button class="qr-nav-btn" id="prevBtn">← 上一页</button>
                 <button class="qr-nav-btn" id="playBtn">▶ 播放</button>
-                <button class="qr-nav-btn" id="nextBtn">下一个 →</button>
+                <button class="qr-nav-btn" id="nextBtn">下一页 →</button>
             </div>
 
             <div class="qr-display">
@@ -146,7 +146,7 @@
                         <div id="qrcode"></div>
                     </div>
                     <div class="chunks-jump-row" id="chunkJumpRow">
-                        <span>跳转到</span>
+                        <span>跳转到数据分片</span>
                         <input type="number" id="chunkJumpInput" min="1" max="1" value="1">
                         <button type="button" class="chunks-jump-btn" id="chunkJumpBtn">确定</button>
                     </div>
@@ -180,6 +180,6 @@
     <!-- 共享工具函数 -->
     <script src="../shared/utils.js"></script>
     <!-- 发送端逻辑 -->
-    <script src="sender.js"></script>
+    <script src="sender.js?v=20260726-dual1"></script>
 </body>
 </html>

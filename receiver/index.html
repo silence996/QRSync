@@ -6,7 +6,7 @@
     <meta name="apple-mobile-web-app-capable" content="yes">
     <title>QRSync - 接收端</title>
     <link rel="stylesheet" href="../shared/theme.css">
-    <link rel="stylesheet" href="receiver.css">
+    <link rel="stylesheet" href="receiver.css?v=20260726-dual1">
 </head>
 <body>
     <nav>
@@ -185,6 +185,11 @@
     </script>
     <script src="../js/zxing-wasm-reader.js"></script>
     <script>
+        // 主线程一份 + Worker 池各一份（需独立 ArrayBuffer，不可 transfer 共享）
+        window.__QRSyncWasmBinaryCopies = [
+            _wasmBinary.slice(0),
+            _wasmBinary.slice(0)
+        ];
         ZXingWASM.setZXingModuleOverrides({ wasmBinary: _wasmBinary });
         _wasmBinary = null;
         // 预热 wasm，标记就绪状态
@@ -202,6 +207,6 @@
     <!-- 共享工具函数 -->
     <script src="../shared/utils.js"></script>
     <!-- 接收端逻辑 -->
-    <script src="receiver.js?v=20260726-decode1"></script>
+    <script src="receiver.js?v=20260726-dual1"></script>
 </body>
 </html>
