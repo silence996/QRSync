@@ -19,6 +19,10 @@ let lastScanTime = 0;
 let cropCanvas = null;
 let cropCtx = null;
 
+// 连播：默认关 rotate/invert 以提速；连续未识别再升级（不影响 tryHarder）
+let zxingMissStreak = 0;
+const ZXING_HARD_AFTER_MISS = 2;
+
 // 虚拟模式状态
 let imageQueue = [];
 let currentImageIndex = -1;
@@ -41,23 +45,46 @@ const RESOLUTION_PRESETS = {
     ]
 };
 
+function getZXingOptions(forceHard) {
+    // tryHarder 始终开启，保证成功率；rotate/invert 仅难扫时开启
+    const hard = !!forceHard || zxingMissStreak >= ZXING_HARD_AFTER_MISS;
+    return {
+        formats: ['QRCode'],
+        tryHarder: true,
+        tryRotate: hard,
+        tryInvert: hard,
+        tryDownscale: false,
+        maxNumberOfSymbols: 1
+    };
+}
+
+function noteDecodeResult(ok) {
+    if (ok) zxingMissStreak = 0;
+    else zxingMissStreak++;
+}
+
 // ===== 统一解码函数 =====
 // 接受 ImageData，优先用 zxing-wasm（C++ 级别），失败后用 jsQR 兜底
-async function decodeImageData(imgData) {
+async function decodeImageData(imgData, { forceHard = false } = {}) {
+    let text = null;
     if (typeof ZXingWASM !== 'undefined' && ZXingWASM._wasmReady) {
         try {
-            const results = await ZXingWASM.readBarcodesFromImageData(imgData, {
-                formats: ['QRCode'],
-                tryHarder: true,
-                tryRotate: true,
-                tryInvert: true,
-            });
-            if (results.length > 0) return results[0].text;
+            const results = await ZXingWASM.readBarcodesFromImageData(
+                imgData,
+                getZXingOptions(forceHard)
+            );
+            if (results.length > 0) text = results[0].text;
         } catch (_) {}
     }
-    // jsQR 后备
-    const r = jsQR(imgData.data, imgData.width, imgData.height, { inversionAttempts: 'dontInvert' });
-    return r ? r.data : null;
+    // jsQR 后备：仅在 hard 或已连续 miss 时使用，避免每帧双解码拖慢
+    if (!text && (forceHard || zxingMissStreak >= ZXING_HARD_AFTER_MISS)) {
+        const r = jsQR(imgData.data, imgData.width, imgData.height, {
+            inversionAttempts: forceHard ? 'attemptBoth' : 'dontInvert'
+        });
+        text = r ? r.data : null;
+    }
+    noteDecodeResult(!!text);
+    return text;
 }
 
 // ===== 相机模式 =====
@@ -92,7 +119,7 @@ function formatResolutionLabel(actual) {
     return `${actual.width}×${actual.height} ${tag}`;
 }
 
-// 从视频帧裁出中心正方形的 ImageData，与 CSS object-fit:cover 的裁剪一致
+// 从视频帧裁出中心正方形的 ImageData（1:1，不降采样），与 CSS object-fit:cover 一致
 function captureFrame(video) {
     const vw = video.videoWidth;
     const vh = video.videoHeight;
@@ -104,9 +131,12 @@ function captureFrame(video) {
         cropCanvas = document.createElement('canvas');
         cropCtx = cropCanvas.getContext('2d', { willReadFrequently: true });
     }
-    cropCanvas.width = size;
-    cropCanvas.height = size;
-    cropCtx.imageSmoothingEnabled = true;
+    if (cropCanvas.width !== size || cropCanvas.height !== size) {
+        cropCanvas.width = size;
+        cropCanvas.height = size;
+    }
+    // 无缩放，关闭平滑避免无关插值开销
+    cropCtx.imageSmoothingEnabled = false;
     cropCtx.drawImage(video, sx, sy, size, size, 0, 0, size, size);
     return cropCtx.getImageData(0, 0, size, size);
 }
@@ -144,6 +174,7 @@ function stopScanLoop() {
     }
     cropCanvas = null;
     cropCtx = null;
+    zxingMissStreak = 0;
 }
 
 async function initCameraList() {
@@ -417,7 +448,7 @@ async function scanCurrent() {
         const ctx = canvas.getContext('2d');
         const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-        const text = await decodeImageData(imgData);
+        const text = await decodeImageData(imgData, { forceHard: true });
         if (text) {
             processChunkData(text);
             item.status = 'completed';
