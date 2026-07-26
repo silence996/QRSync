@@ -34,6 +34,110 @@ const DECODE_WORKER_COUNT = 2;
 /** 左右半幅中线重叠比例，避免 quiet zone 被切掉 */
 const HALF_OVERLAP_RATIO = 0.04;
 
+/**
+ * 跳帧/吞吐诊断（F12 Console 过滤 [scan]）
+ * 也可读 window.QRSyncScanStats / 调 window.QRSyncDumpScanStats()
+ */
+const SCAN_STATS = {
+    startedAt: 0,
+    ticks: 0,
+    sampled: 0,
+    busyDrop: 0,
+    busyKeep: 0,
+    queueDrop: 0,
+    queueSkipDup: 0,
+    fingerprintSkip: 0,
+    fullFbSkipped: 0,
+    captureMsSum: 0,
+    splitMsSum: 0,
+    dualMsSum: 0,
+    fullFallback: 0,
+    fullFallbackMsSum: 0,
+    dualHitBoth: 0,
+    dualHitLeft: 0,
+    dualHitRight: 0,
+    dualMiss: 0,
+    halfRetry: 0,
+    halfRetryHit: 0,
+    acceptNew: 0,
+    acceptDup: 0,
+    debounceSkip: 0,
+    lastDecodeMs: 0,
+    maxDecodeMs: 0,
+    decodeN: 0,
+    decodeMsSum: 0
+};
+window.QRSyncScanStats = SCAN_STATS;
+
+/** 连续 dual MISS 达到该次数才允许全幅兜底 */
+const FULL_FALLBACK_AFTER_MISS = 3;
+/** busy 时历史帧 FIFO 容量（满则丢最旧）；去重后可略加大 */
+const FRAME_QUEUE_MAX = 3;
+
+function resetScanStats() {
+    Object.keys(SCAN_STATS).forEach((k) => {
+        if (typeof SCAN_STATS[k] === 'number') SCAN_STATS[k] = 0;
+    });
+    SCAN_STATS.startedAt = performance.now();
+}
+
+function parseChunkMeta(text) {
+    if (!text || typeof text !== 'string') return null;
+    try {
+        let t = text.trim();
+        if (!t.startsWith('{')) t = t.substring(t.indexOf('{'));
+        if (!t.endsWith('}')) t = t.substring(0, t.lastIndexOf('}') + 1);
+        const o = JSON.parse(t);
+        if (o && o.t === 'fn') return { kind: 'fn', i: -1, t: o.tc };
+        if (o && typeof o.i === 'number') return { kind: 'data', i: o.i + 1, t: o.t };
+    } catch (_) {}
+    return null;
+}
+
+/** 半幅补洞：got 是否与已命中侧 anchorIndex（1-based）成对（左奇右偶相邻） */
+function isComplementHalf(missSide, gotMeta, anchorIndex) {
+    if (!gotMeta || gotMeta.kind !== 'data' || typeof anchorIndex !== 'number' || anchorIndex < 1) {
+        return false;
+    }
+    if (missSide === 'left') return gotMeta.i === anchorIndex - 1;
+    return gotMeta.i === anchorIndex + 1;
+}
+
+function noteDecodeCycleMs(ms) {
+    SCAN_STATS.decodeN++;
+    SCAN_STATS.decodeMsSum += ms;
+    SCAN_STATS.lastDecodeMs = ms;
+    if (ms > SCAN_STATS.maxDecodeMs) SCAN_STATS.maxDecodeMs = ms;
+}
+
+function dumpScanStats(reason) {
+    const n = Math.max(1, SCAN_STATS.decodeN);
+    const avg = SCAN_STATS.decodeMsSum / n;
+    const elapsed = (performance.now() - SCAN_STATS.startedAt) / 1000;
+    console.log(
+        `[scan] ===== stats (${reason || 'dump'}) =====\n` +
+        `  elapsed=${elapsed.toFixed(1)}s sampled=${SCAN_STATS.sampled}` +
+        ` busyKeep=${SCAN_STATS.busyKeep} queueDrop=${SCAN_STATS.queueDrop}` +
+        ` qSkipDup=${SCAN_STATS.queueSkipDup}` +
+        ` fpSkip=${SCAN_STATS.fingerprintSkip}` +
+        ` fullFbSkip=${SCAN_STATS.fullFbSkipped}\n` +
+        `  decode n=${SCAN_STATS.decodeN} avg=${avg.toFixed(1)}ms max=${SCAN_STATS.maxDecodeMs.toFixed(1)}ms last=${SCAN_STATS.lastDecodeMs.toFixed(1)}ms\n` +
+        `  dual HIT both=${SCAN_STATS.dualHitBoth} L=${SCAN_STATS.dualHitLeft} R=${SCAN_STATS.dualHitRight}` +
+        ` MISS=${SCAN_STATS.dualMiss} halfRetry=${SCAN_STATS.halfRetry}/${SCAN_STATS.halfRetryHit}` +
+        ` fullFb=${SCAN_STATS.fullFallback}\n` +
+        `  accept new=${SCAN_STATS.acceptNew} dup=${SCAN_STATS.acceptDup} debounce=${SCAN_STATS.debounceSkip}\n` +
+        `  timing avg capture=${(SCAN_STATS.captureMsSum / n).toFixed(1)}ms` +
+        ` split=${(SCAN_STATS.splitMsSum / n).toFixed(1)}ms` +
+        ` dual=${(SCAN_STATS.dualMsSum / n).toFixed(1)}ms` +
+        (SCAN_STATS.fullFallback
+            ? ` fullFb=${(SCAN_STATS.fullFallbackMsSum / Math.max(1, SCAN_STATS.fullFallback)).toFixed(1)}ms`
+            : '') +
+        `\n  建议播放间隔 ≥ ${Math.ceil(avg * 1.25)}ms（decodeAvg×1.25；双码页≈2 分片）`
+    );
+}
+/** 手动查看扫描统计：控制台执行 QRSyncDumpScanStats() */
+window.QRSyncDumpScanStats = dumpScanStats;
+
 const DB = localforage.createInstance({ name: 'qrcode-receiver-v2' });
 
 // ===== Decode Worker 池（同帧左/右各一路） =====
@@ -322,6 +426,18 @@ async function decodeDualHalves(left, right, { forceHard = false } = {}) {
     return { leftText, rightText, hit };
 }
 
+/** 单半幅解码（补洞用，强度与双解码相同） */
+async function decodeOneHalf(imgData, { forceHard = false } = {}) {
+    const options = getZXingOptions(forceHard);
+    if (decodeWorkerReady) {
+        try {
+            const text = await decodeOnWorker(imgData, options);
+            if (text) return text;
+        } catch (_) {}
+    }
+    return decodeImageDataMain(imgData, { forceHard });
+}
+
 // ===== 相机模式 =====
 
 async function tryOpenStream(deviceId, candidates) {
@@ -393,44 +509,239 @@ function splitFrameHalves(imgData) {
     return { left, right };
 }
 
+/**
+ * 钝化画面指纹：量化亮度、稀疏采样，降低摄像头噪声导致的同页误判。
+ * 仅在「双码都已 HIT」后用于跳过重复解码，不降低解码强度。
+ */
+function cheapFrameFingerprint(imgData) {
+    const { data, width, height } = imgData;
+    let h = (width * 131 + height) | 0;
+    const stepX = Math.max(1, (width / 6) | 0);
+    const stepY = Math.max(1, (height / 6) | 0);
+    for (let y = stepY >> 1; y < height; y += stepY) {
+        for (let x = stepX >> 1; x < width; x += stepX) {
+            const i = (y * width + x) * 4;
+            // >>5 → 32 级量化，抗轻微曝光抖动
+            const q = (data[i] >> 5) + (data[i + 1] >> 5) * 8 + (data[i + 2] >> 5) * 64;
+            h = (Math.imul(h, 33) + q) | 0;
+        }
+    }
+    return h;
+}
+
 function startScanLoop(video) {
     let decoding = false;
+    /** busy 时 FIFO，最多 FRAME_QUEUE_MAX 帧；满则丢最旧 */
+    const frameQueue = [];
+    /** 双码都命中后的画面指纹；指纹不变则跳过解码 */
+    let lastBothHitFp = null;
+    /** 正在解码的画面指纹（入队去重用） */
+    let decodingFp = null;
+    /** 队尾画面指纹 */
+    let lastQueuedFp = null;
+    let dualMissStreak = 0;
+    /**
+     * 单侧 HIT 后的补洞：下一帧先解缺失半幅；须与 anchorIndex 成对才算补洞成功。
+     * { missSide: 'left'|'right', anchorIndex: number|null }
+     */
+    let partialPending = null;
+    /** 单侧 HIT 后先让下一 tick 半幅补洞，再消费队列 */
+    let holdQueueOnce = false;
+
+    resetScanStats();
+
+    function clearFrameQueue() {
+        frameQueue.length = 0;
+        lastQueuedFp = null;
+    }
+
+    function enqueueFrame(full) {
+        const fp = cheapFrameFingerprint(full);
+        // 与当前解码帧 / 已双 HIT 同页 → 不占槽
+        if ((decodingFp !== null && fp === decodingFp) ||
+            (lastBothHitFp !== null && fp === lastBothHitFp)) {
+            SCAN_STATS.queueSkipDup++;
+            return;
+        }
+        if (frameQueue.length > 0 && lastQueuedFp === fp) {
+            frameQueue[frameQueue.length - 1] = { full: full, fp: fp };
+            SCAN_STATS.busyKeep++;
+            return;
+        }
+        frameQueue.push({ full: full, fp: fp });
+        lastQueuedFp = fp;
+        SCAN_STATS.busyKeep++;
+        if (frameQueue.length > FRAME_QUEUE_MAX) {
+            frameQueue.shift();
+            SCAN_STATS.queueDrop++;
+        }
+    }
+
+    function takeNextFrame() {
+        const item = frameQueue.length ? frameQueue.shift() : null;
+        lastQueuedFp = frameQueue.length ? frameQueue[frameQueue.length - 1].fp : null;
+        return item ? item.full : null;
+    }
+
+    async function runDecode(full) {
+        decoding = true;
+        SCAN_STATS.sampled++;
+        const t0 = performance.now();
+
+        try {
+            const fp = cheapFrameFingerprint(full);
+            decodingFp = fp;
+
+            if (lastBothHitFp !== null && fp === lastBothHitFp) {
+                SCAN_STATS.fingerprintSkip++;
+                return;
+            }
+
+            const tSplit0 = performance.now();
+            const { left, right } = splitFrameHalves(full);
+            SCAN_STATS.splitMsSum += performance.now() - tSplit0;
+
+            let leftText = null;
+            let rightText = null;
+            let hit = false;
+
+            // A: 有 pending 时下一帧先半幅补洞；须与 anchor 成对；MISS 不同帧双解
+            if (partialPending) {
+                const missSide = partialPending.missSide;
+                const anchorIndex = partialPending.anchorIndex;
+                partialPending = null;
+                SCAN_STATS.halfRetry++;
+                const tHalf0 = performance.now();
+                const missImg = missSide === 'left' ? left : right;
+                const text = await decodeOneHalf(missImg);
+                const halfMs = performance.now() - tHalf0;
+                SCAN_STATS.dualMsSum += halfMs;
+                const gotMeta = parseChunkMeta(text);
+
+                if (text && isComplementHalf(missSide, gotMeta, anchorIndex)) {
+                    SCAN_STATS.halfRetryHit++;
+                    handleScanResult(text);
+                    dualMissStreak = 0;
+                    noteDecodeResult(true);
+                    lastBothHitFp = fp;
+                    clearFrameQueue();
+                    if (missSide === 'left') SCAN_STATS.dualHitLeft++;
+                    else SCAN_STATS.dualHitRight++;
+                    noteDecodeCycleMs(performance.now() - t0);
+                    return;
+                }
+
+                if (!text) {
+                    // MISS：不再同帧双解，避免 half+dual ≈ 800ms+
+                    noteDecodeResult(false);
+                    noteDecodeCycleMs(performance.now() - t0);
+                    return;
+                }
+                // 翻页：半幅解到了别的码，同帧改走完整双解
+            }
+
+            const tDual0 = performance.now();
+            const dual = await decodeDualHalves(left, right);
+            leftText = dual.leftText;
+            rightText = dual.rightText;
+            hit = dual.hit;
+            SCAN_STATS.dualMsSum += performance.now() - tDual0;
+
+            const leftMeta = parseChunkMeta(leftText);
+            const rightMeta = parseChunkMeta(rightText);
+
+            if (leftText && rightText) SCAN_STATS.dualHitBoth++;
+            else if (leftText) SCAN_STATS.dualHitLeft++;
+            else if (rightText) SCAN_STATS.dualHitRight++;
+            else SCAN_STATS.dualMiss++;
+
+            if (leftText) handleScanResult(leftText);
+            if (rightText) handleScanResult(rightText);
+
+            if (leftText && rightText) {
+                dualMissStreak = 0;
+                noteDecodeResult(true);
+                lastBothHitFp = fp;
+                partialPending = null;
+                clearFrameQueue();
+            } else if (hit) {
+                dualMissStreak = 0;
+                noteDecodeResult(true);
+                lastBothHitFp = null;
+                const hitMeta = leftText ? leftMeta : rightMeta;
+                partialPending = {
+                    missSide: leftText ? 'right' : 'left',
+                    anchorIndex: hitMeta && hitMeta.kind === 'data' ? hitMeta.i : null
+                };
+                holdQueueOnce = true;
+            } else {
+                dualMissStreak++;
+                noteDecodeResult(false);
+                lastBothHitFp = null;
+                partialPending = null;
+
+                if (dualMissStreak >= FULL_FALLBACK_AFTER_MISS) {
+                    const options = getZXingOptions(false);
+                    const tFull0 = performance.now();
+                    let text = null;
+                    if (decodeWorkerReady) {
+                        try { text = await decodeOnWorker(full, options); } catch (_) {}
+                    }
+                    if (!text) text = await decodeImageDataMain(full, { forceHard: false });
+                    SCAN_STATS.fullFallback++;
+                    SCAN_STATS.fullFallbackMsSum += performance.now() - tFull0;
+                    if (text) {
+                        handleScanResult(text);
+                        dualMissStreak = 0;
+                        lastBothHitFp = fp;
+                    }
+                } else {
+                    SCAN_STATS.fullFbSkipped++;
+                }
+            }
+
+            noteDecodeCycleMs(performance.now() - t0);
+        } catch (err) {
+            console.warn('[scan] decode error:', err && err.message ? err.message : err);
+            lastBothHitFp = null;
+            partialPending = null;
+        } finally {
+            decoding = false;
+            decodingFp = null;
+            if (!isScanning) {
+                clearFrameQueue();
+                return;
+            }
+            if (holdQueueOnce) {
+                holdQueueOnce = false;
+                return;
+            }
+            const next = takeNextFrame();
+            if (next) runDecode(next);
+        }
+    }
 
     async function tick(now) {
         if (!isScanning) return;
         scanRafId = requestAnimationFrame(tick);
+        SCAN_STATS.ticks++;
 
         if (now - lastFrameTime < 1000 / SCAN_FPS) return;
         lastFrameTime = now;
-        if (decoding || video.readyState < 2) return;
-        decoding = true;
+        if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) return;
 
-        try {
-            if (!video.videoWidth || !video.videoHeight) return;
-            const full = captureFullFrame(video);
-            if (!full) return;
-            const { left, right } = splitFrameHalves(full);
-            const { leftText, rightText, hit } = await decodeDualHalves(left, right);
-            // 两路结果都处理（不同分片）；同文去抖在 handleScanResult
-            if (leftText) handleScanResult(leftText);
-            if (rightText) handleScanResult(rightText);
-            // 文件名单页居中时左右切开会失败 → 全幅兜底
-            if (!hit) {
-                const options = getZXingOptions(false);
-                let text = null;
-                if (decodeWorkerReady) {
-                    try { text = await decodeOnWorker(full, options); } catch (_) {}
-                }
-                if (!text) text = await decodeImageDataMain(full, { forceHard: false });
-                if (text) handleScanResult(text);
-                noteDecodeResult(!!text);
-            } else {
-                noteDecodeResult(true);
-            }
-        } catch (_) {
-        } finally {
-            decoding = false;
+        const tCap0 = performance.now();
+        const full = captureFullFrame(video);
+        const captureMs = performance.now() - tCap0;
+        if (!full) return;
+        SCAN_STATS.captureMsSum += captureMs;
+
+        if (decoding) {
+            enqueueFrame(full);
+            return;
         }
+
+        runDecode(full);
     }
 
     scanRafId = requestAnimationFrame(tick);
@@ -440,6 +751,9 @@ function stopScanLoop() {
     if (scanRafId !== null) {
         cancelAnimationFrame(scanRafId);
         scanRafId = null;
+    }
+    if (SCAN_STATS.decodeN > 0 || SCAN_STATS.busyKeep > 0 || SCAN_STATS.fingerprintSkip > 0) {
+        dumpScanStats('stop');
     }
     frameCanvas = null;
     frameCtx = null;
@@ -547,7 +861,10 @@ async function stopCamera() {
 
 function handleScanResult(decodedText) {
     const now = Date.now();
-    if (now - lastScanTime < 800 && decodedText === lastDecodedText) return;
+    if (now - lastScanTime < 800 && decodedText === lastDecodedText) {
+        SCAN_STATS.debounceSkip++;
+        return;
+    }
     lastScanTime = now;
     lastDecodedText = decodedText;
 
@@ -622,16 +939,18 @@ async function processChunkData(data) {
             }
 
             if (receivedChunks.has(chunk.i)) {
-                showFloatingMessage(`⚠️ 分片 ${chunk.i+1}/${chunk.t} 已接收过`);
+                SCAN_STATS.acceptDup++;
                 return;
             }
+
+            SCAN_STATS.acceptNew++;
 
             if (!fileInfo) fileInfo = { fingerprint: chunk.f, totalChunks: chunk.t, filename: '未知文件', size: 0 };
 
             receivedChunks.set(chunk.i, chunk.d);
             await saveProgress();
             updateUI();
-            showFloatingMessage(`✅ 分片 ${chunk.i+1}/${chunk.t}`);
+            // 常规分片不弹浮层（避免数万次 DOM 动画）；错误/文件名仍提示
             showCameraStatus(`✅ 成功接收数据分片 ${chunk.i+1}/${fileInfo.totalChunks}`, 'success');
         }
 
@@ -775,12 +1094,29 @@ function showCameraStatus(message, type) {
     el.className = 'status-message show status-' + type;
 }
 
+let floatingMsgEl = null;
+let floatingMsgTimer = null;
+
 function showFloatingMessage(message, isError = false) {
-    const msg = document.createElement('div');
-    msg.className = 'floating-message' + (isError ? ' floating-error' : '');
-    msg.textContent = message;
-    document.body.appendChild(msg);
-    setTimeout(() => msg.remove(), 2800);
+    if (!floatingMsgEl) {
+        floatingMsgEl = document.createElement('div');
+        document.body.appendChild(floatingMsgEl);
+    }
+    floatingMsgEl.className = 'floating-message' + (isError ? ' floating-error' : '');
+    floatingMsgEl.textContent = message;
+    // 重启动画，替换而非堆叠
+    floatingMsgEl.style.animation = 'none';
+    void floatingMsgEl.offsetWidth;
+    floatingMsgEl.style.animation = '';
+
+    if (floatingMsgTimer) clearTimeout(floatingMsgTimer);
+    floatingMsgTimer = setTimeout(() => {
+        if (floatingMsgEl) {
+            floatingMsgEl.remove();
+            floatingMsgEl = null;
+        }
+        floatingMsgTimer = null;
+    }, 2200);
 }
 
 function updateUI() {
